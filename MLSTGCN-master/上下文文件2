@@ -1,0 +1,380 @@
+{
+  "role": "coding_research_assistant",
+  "language": "zh-CN",
+  "workspace": "E:\\学校\\毕业设计\\开题报告相关论文\\多图\\动态多图\\MLSTGCN-master\\MLSTGCN-master",
+  "current_date": "2026-05-14",
+  "user_preferences": {
+    "style": "中文回答，工程上直接、细致但不要过长",
+    "workflow": "优先读取项目文件再判断；能实现就实现；每次回答最后询问是否继续下一步",
+    "important_rule": "以后每次跑实验都尽量支持 W&B 实时查看",
+    "do_not_upload_large_files": [
+      "data/",
+      "logs/",
+      "wandb/",
+      "*.ckpt",
+      "*.npz",
+      "*.npy",
+      "二月份数据处理/纽约单车订单数据/"
+    ]
+  },
+  "project_goal": {
+    "main_topic": "共享单车小时级骑入/骑出流量预测，后续用于库存风险与调度仿真",
+    "current_focus": "预测实验，不考虑调度优化",
+    "dataset_shift": "早期 JC 数据流量太小，已切换到全 NYC Citi Bike 订单数据 + GBFS 库存快照匹配站点",
+    "current_dataset": "top150 NYC 热门站点，rolling-anchor 6h 预测任务",
+    "external_holdout": "2026-02-01 至 2026-02-28 真实订单数据外部测试",
+    "anchor_hours": [0, 6, 12, 16, 20],
+    "target_start_offset": 1,
+    "prediction_task": "每个 anchor 时刻 t，使用过去 hist_len 小时历史数据，预测 t+1 到 t+6 的小时骑出/骑入量",
+    "current_mainline": "exp10_fast_cached_fusion_hist168_pred6"
+  },
+  "core_model_context": {
+    "base_model": "MSTGCN / MLSTGCN 动态多图时空图卷积网络",
+    "reference_paper": "Long-term Spatio-Temporal Forecasting via Dynamic Multiple-Graph Attention.pdf",
+    "main_graphs": [
+      "dist",
+      "neighb",
+      "distri",
+      "tempp",
+      "func",
+      "od00",
+      "od06",
+      "od12",
+      "od16",
+      "od20"
+    ],
+    "current_full_graph_use": "dist,neighb,distri,tempp,func,od00,od06,od12,od16,od20",
+    "current_model_config": {
+      "hist_len": 168,
+      "pred_len": 6,
+      "batch_size": 8,
+      "precision": 32,
+      "loss": "huber",
+      "huber_delta": 2.0,
+      "lr": 5e-5,
+      "weight_decay": 1e-4,
+      "early_stop_patience": 8,
+      "lr_patience": 3,
+      "lr_factor": 0.5,
+      "min_lr": 1e-6,
+      "graph_attention": true,
+      "matrix_weight": true,
+      "graph_sparsify_mode": "topk",
+      "graph_topk": 20,
+      "time_kernel_size": 3,
+      "channel_attention": false,
+      "nb_block": 2,
+      "nb_chev_filter": 64,
+      "nb_time_filter": 64,
+      "cheb_k": 3
+    }
+  },
+  "important_experiment_results": {
+    "exp06_hist_len_comparison_external_feb2026": {
+      "hist72": {
+        "mae": 2.1269619464874268,
+        "rmse": 3.2094435691833496,
+        "best_val_mae": 4.282
+      },
+      "hist168": {
+        "mae": 2.1107583045959473,
+        "rmse": 3.074810028076172,
+        "best_val_mae": 3.9568
+      },
+      "hist336": {
+        "mae": 2.3415777683258057,
+        "rmse": 3.6720099449157715,
+        "best_val_mae": 5.3312
+      },
+      "conclusion": "hist168 最好；hist336 反而变差，说明直接拉长历史窗口会引入噪声"
+    },
+    "gru_baseline": {
+      "context": "轻量 GRU baseline 已实现并跑完，用 rolling-anchor 数据集直接训练",
+      "conclusion": "MSTGCN 主线仍优于简单序列模型；rolling 6h 中时间规律本身很强"
+    },
+    "traditional_baselines_selected_text": {
+      "current_model_mae": 2.3455,
+      "last_1h_repeat_mae": 3.4344,
+      "previous_day_same_hours_mae": 2.6614,
+      "historical_average_train_mean_mae": 7.7810,
+      "note": "该片段曾被用户选中，希望项目中留记号避免遗忘"
+    },
+    "exp09_channel_attention_hist168": {
+      "external_feb_mae": 2.1943764686584473,
+      "external_feb_rmse": 3.226754665374756,
+      "best_val_mae": 3.9422,
+      "internal_test_mae": 3.0612,
+      "conclusion": "验证集不差，但外部 Feb holdout 变差，不作为主线"
+    },
+    "exp10_anchor_hour_od_hist168": {
+      "external_feb_mae": 2.081089973449707,
+      "external_feb_rmse": 3.073373794555664,
+      "best_val_mae": 3.9757,
+      "internal_test_mae": 3.08797,
+      "anchor_mae": {
+        "00": 0.72826,
+        "06": 2.68804,
+        "12": 3.21257,
+        "16": 2.62633,
+        "20": 1.11578
+      },
+      "horizon_mae": {
+        "h1": 2.16537,
+        "h2": 2.35774,
+        "h3": 2.08834,
+        "h4": 1.91144,
+        "h5": 1.96791,
+        "h6": 1.99574
+      },
+      "conclusion": "anchor-hour OD 图有效，比 exp06 hist168 有提升"
+    },
+    "exp10_fast_cached_fusion_seed0": {
+      "project": "bike_hourly_safe_inventory_top150_exp10_fast_cached_fusion_hist168_pred6_bs8_seed0",
+      "wandb_run_id": "zk9nk0vl",
+      "best_checkpoint": "wandb\\run-20260512_201110-zk9nk0vl\\files\\top150_rolling6h_model_compare\\zk9nk0vl\\checkpoints\\best-epoch=59-val_mae_epoch=val_mae_epoch=3.9506.ckpt",
+      "best_val_mae": 3.9506,
+      "external_feb_mae": 2.013787269592285,
+      "external_feb_rmse": 3.0536587238311768,
+      "baseline_mae": {
+        "last_1h_repeat": 3.434448480606079,
+        "previous_day_same_hours": 2.661362886428833,
+        "train_mean_by_horizon": 7.409128189086914
+      },
+      "improvement_pct": {
+        "vs_last_1h": 41.365046499782956,
+        "vs_previous_day": 24.332480930682152,
+        "vs_train_mean": 72.82018588153946
+      },
+      "anchor_mae": {
+        "00": 0.7476294314823585,
+        "06": 2.6887451601928145,
+        "12": 3.106401726194945,
+        "16": 2.458954776872103,
+        "20": 1.0321474644532502
+      },
+      "horizon_mae": {
+        "h1": 2.1131106960755806,
+        "h2": 2.2830233438728604,
+        "h3": 1.971993460465862,
+        "h4": 1.8218131852620385,
+        "h5": 1.8620161550528167,
+        "h6": 2.0307677143652283
+      },
+      "conclusion": "当前主线 seed0，融合图 forward 缓存后外部 holdout 更好"
+    },
+    "exp10_fast_cached_fusion_seed1": {
+      "project": "bike_hourly_safe_inventory_top150_exp10_fast_cached_fusion_hist168_pred6_bs8_seed1",
+      "wandb_run_id": "34rb64u0",
+      "best_checkpoint": "wandb\\run-20260513_160340-34rb64u0\\files\\top150_rolling6h_model_compare\\34rb64u0\\checkpoints\\best-epoch=48-val_mae_epoch=val_mae_epoch=3.9888.ckpt",
+      "best_val_mae": 3.9888,
+      "external_feb_mae": 1.974557638168335,
+      "external_feb_rmse": 2.9908931255340576,
+      "baseline_mae": {
+        "last_1h_repeat": 3.434448480606079,
+        "previous_day_same_hours": 2.661362886428833,
+        "train_mean_by_horizon": 7.409128189086914
+      },
+      "improvement_pct": {
+        "vs_last_1h": 42.50728612414988,
+        "vs_previous_day": 25.806523858987607,
+        "vs_train_mean": 73.34966290532388
+      },
+      "anchor_mae": {
+        "00": 0.634173528864266,
+        "06": 2.6080412704872225,
+        "12": 3.111221073340196,
+        "16": 2.479077079414027,
+        "20": 1.0056724069326068
+      },
+      "horizon_mae": {
+        "h1": 2.1840050570941476,
+        "h2": 2.2649909598083866,
+        "h3": 1.918972917730467,
+        "h4": 1.6607130105208405,
+        "h5": 1.8517847084162347,
+        "h6": 1.9668794318748293
+      },
+      "conclusion": "seed1 比 seed0 外部 holdout 更好，说明主线稳定"
+    },
+    "exp10_fast_mainline_summary": {
+      "seed0_mae": 2.013787269592285,
+      "seed1_mae": 1.974557638168335,
+      "mean_mae": 1.99417245388031,
+      "mean_rmse": 3.022275924682617,
+      "improvement_vs_exp06_hist168_mean_pct": 5.52,
+      "improvement_vs_original_exp10_mean_pct": 4.18,
+      "conclusion": "正式当前预测主线：exp10_fast_cached_fusion_hist168_pred6"
+    },
+    "exp10_fast_no_distri": {
+      "project": "bike_hourly_safe_inventory_top150_exp10_fast_no_distri_hist168_pred6_bs8_seed0",
+      "graph_use": [
+        "dist",
+        "neighb",
+        "tempp",
+        "func",
+        "od00",
+        "od06",
+        "od12",
+        "od16",
+        "od20"
+      ],
+      "best_val_mae": 3.9984,
+      "internal_test_mae": 3.084242105484009,
+      "external_feb_mae": 2.1464223861694336,
+      "external_feb_rmse": 3.1847989559173584,
+      "conclusion": "去掉 distri 明显变差，distri 和 OD 图不是完全冗余；后续主线保留 distri"
+    },
+    "exp11_weekly_periodic_features": {
+      "status": "已实现并生成数据集，尚未训练或等待用户训练",
+      "based_on": "exp10_fast 主线",
+      "dataset_dir": "data\\temporal_data\\bike_hourly_safe_inventory_top150_exp11_weekly_periodic_features_hist168_pred6",
+      "graph_dir": "data\\graph\\bike_hourly_safe_inventory_top150_exp10_anchor_hour_od_graph_train2025_hist168",
+      "original_x_shape": [1254, 168, 150, 21],
+      "new_x_shape": [1254, 168, 150, 45],
+      "y_shape": [1254, 6, 150, 2],
+      "added_feature_count": 24,
+      "added_features": [
+        "periodic_prev_day_h1_小时骑出量",
+        "periodic_prev_day_h1_小时骑入量",
+        "periodic_prev_day_h2_小时骑出量",
+        "periodic_prev_day_h2_小时骑入量",
+        "periodic_prev_day_h3_小时骑出量",
+        "periodic_prev_day_h3_小时骑入量",
+        "periodic_prev_day_h4_小时骑出量",
+        "periodic_prev_day_h4_小时骑入量",
+        "periodic_prev_day_h5_小时骑出量",
+        "periodic_prev_day_h5_小时骑入量",
+        "periodic_prev_day_h6_小时骑出量",
+        "periodic_prev_day_h6_小时骑入量",
+        "periodic_prev_week_h1_小时骑出量",
+        "periodic_prev_week_h1_小时骑入量",
+        "periodic_prev_week_h2_小时骑出量",
+        "periodic_prev_week_h2_小时骑入量",
+        "periodic_prev_week_h3_小时骑出量",
+        "periodic_prev_week_h3_小时骑入量",
+        "periodic_prev_week_h4_小时骑出量",
+        "periodic_prev_week_h4_小时骑入量",
+        "periodic_prev_week_h5_小时骑出量",
+        "periodic_prev_week_h5_小时骑入量",
+        "periodic_prev_week_h6_小时骑出量",
+        "periodic_prev_week_h6_小时骑入量"
+      ],
+      "important_note": "周期特征直接从每个样本已有的 168 小时历史窗口中抽取，不引入未来泄露",
+      "evaluation_rule": "评估脚本已改为自动识别 periodic_ 特征并在 Feb holdout 样本中按同规则追加"
+    }
+  },
+  "files_created_or_modified": {
+    "exp10_fast_version_dir": "版本管理\\2026-05-12_exp10_fast_cached_fusion_hist168",
+    "important_scripts": {
+      "train_script": "版本管理\\2026-05-12_exp10_fast_cached_fusion_hist168\\train_bike_hourly_exp10_fast_cached_fusion.py",
+      "core_train": "版本管理\\2026-05-12_exp10_fast_cached_fusion_hist168\\train_bike.py",
+      "evaluate_script": "版本管理\\2026-05-12_exp10_fast_cached_fusion_hist168\\evaluate_top150_feb2026_holdout_exp10_fast.py",
+      "mainline_compare_script": "版本管理\\2026-05-12_exp10_fast_cached_fusion_hist168\\build_current_mainline_compare.py",
+      "wandb_summary_update_script": "版本管理\\2026-05-12_exp10_fast_cached_fusion_hist168\\update_exp10_fast_holdout_wandb_summary.py",
+      "exp11_dataset_builder": "版本管理\\2026-05-12_exp10_fast_cached_fusion_hist168\\build_exp11_weekly_periodic_dataset.py"
+    },
+    "important_code_changes": {
+      "fusion_cache": "models/MSTGCN.py in exp10_fast version: MSTGCN_submodule.forward 只计算一次 fusiongraph/cheb polynomials，并传给每个 block 复用",
+      "wandb_online": "train_bike.py 已改为 --logger wandb 时强制 WANDB_MODE=online，WandbLogger offline=False；W&B 失败时不再静默 fallback",
+      "eval_recover_graph_use": "evaluate_top150_feb2026_holdout_exp10_fast.py 会从 latest_hourly_training_checkpoint.json 或 training_summary.json 的 resolved_train_argv/entry_args 恢复 graph_use，避免 9图/10图 checkpoint mismatch",
+      "eval_periodic_features": "evaluate_top150_feb2026_holdout_exp10_fast.py 已增加 append_periodic_features_if_needed，用于 exp11 holdout 评估"
+    },
+    "analysis_outputs": {
+      "current_mainline_note": "分析结果\\CURRENT_PREDICTION_MAINLINE.md",
+      "mainline_compare_dir": "分析结果\\2026-05-13_top150_current_mainline_exp10_fast_compare",
+      "mainline_compare_csv": "分析结果\\2026-05-13_top150_current_mainline_exp10_fast_compare\\top150_rolling6h_model_compare_current_mainline.csv",
+      "mainline_compare_png": "分析结果\\2026-05-13_top150_current_mainline_exp10_fast_compare\\fig_top150_current_mainline_exp10_fast_compare.png",
+      "mainline_compare_svg": "分析结果\\2026-05-13_top150_current_mainline_exp10_fast_compare\\fig_top150_current_mainline_exp10_fast_compare.svg"
+    }
+  },
+  "commands_used_or_recommended": {
+    "exp10_fast_seed1_train": "python 版本管理\\2026-05-12_exp10_fast_cached_fusion_hist168\\train_bike_hourly_exp10_fast_cached_fusion.py `\n  --project bike_hourly_safe_inventory_top150_exp10_fast_cached_fusion_hist168_pred6_bs8_seed1 `\n  --batch_size 8 `\n  --precision 32 `\n  --seed 1 `\n  --logger wandb `\n  --wandb_project top150_rolling6h_model_compare `\n  --wandb_run_name exp10_fast_cached_fusion_hist168_pred6_seed1",
+    "exp10_fast_seed1_eval": "python 版本管理\\2026-05-12_exp10_fast_cached_fusion_hist168\\evaluate_top150_feb2026_holdout_exp10_fast.py `\n  --project bike_hourly_safe_inventory_top150_exp10_fast_cached_fusion_hist168_pred6_bs8_seed1 `\n  --anchor_hours \"0,6,12,16,20\" `\n  --target_start_offset 1 `\n  --output_dir 分析结果\\2026-05-13_exp10_fast_cached_fusion_hist168_pred6_seed1_feb2026_holdout",
+    "exp10_fast_no_distri_train": "python 版本管理\\2026-05-12_exp10_fast_cached_fusion_hist168\\train_bike_hourly_exp10_fast_cached_fusion.py `\n  --project bike_hourly_safe_inventory_top150_exp10_fast_no_distri_hist168_pred6_bs8_seed0 `\n  --batch_size 8 `\n  --precision 32 `\n  --seed 0 `\n  --graph_use dist,neighb,tempp,func,od00,od06,od12,od16,od20 `\n  --logger wandb `\n  --wandb_project top150_rolling6h_model_compare `\n  --wandb_run_name exp10_fast_no_distri_hist168_pred6_seed0",
+    "exp10_fast_no_distri_eval": "python 版本管理\\2026-05-12_exp10_fast_cached_fusion_hist168\\evaluate_top150_feb2026_holdout_exp10_fast.py `\n  --project bike_hourly_safe_inventory_top150_exp10_fast_no_distri_hist168_pred6_bs8_seed0 `\n  --anchor_hours \"0,6,12,16,20\" `\n  --target_start_offset 1 `\n  --output_dir 分析结果\\2026-05-13_exp10_fast_no_distri_hist168_pred6_seed0_feb2026_holdout",
+    "exp11_build_dataset": "E:\\Environment\\anaconda_environment\\envs\\mlstgcn_env\\python.exe \"版本管理\\2026-05-12_exp10_fast_cached_fusion_hist168\\build_exp11_weekly_periodic_dataset.py\"",
+    "exp11_train_seed0": "python 版本管理\\2026-05-12_exp10_fast_cached_fusion_hist168\\train_bike_hourly_exp10_fast_cached_fusion.py `\n  --data_dir data\\temporal_data\\bike_hourly_safe_inventory_top150_exp11_weekly_periodic_features_hist168_pred6 `\n  --graph_dir data\\graph\\bike_hourly_safe_inventory_top150_exp10_anchor_hour_od_graph_train2025_hist168 `\n  --project bike_hourly_safe_inventory_top150_exp11_weekly_periodic_features_hist168_pred6_bs8_seed0 `\n  --batch_size 8 `\n  --precision 32 `\n  --seed 0 `\n  --logger wandb `\n  --wandb_project top150_rolling6h_model_compare `\n  --wandb_run_name exp11_weekly_periodic_features_hist168_pred6_seed0",
+    "exp11_eval_seed0": "python 版本管理\\2026-05-12_exp10_fast_cached_fusion_hist168\\evaluate_top150_feb2026_holdout_exp10_fast.py `\n  --data_dir data\\temporal_data\\bike_hourly_safe_inventory_top150_exp11_weekly_periodic_features_hist168_pred6 `\n  --graph_dir data\\graph\\bike_hourly_safe_inventory_top150_exp10_anchor_hour_od_graph_train2025_hist168 `\n  --project bike_hourly_safe_inventory_top150_exp11_weekly_periodic_features_hist168_pred6_bs8_seed0 `\n  --anchor_hours \"0,6,12,16,20\" `\n  --target_start_offset 1 `\n  --output_dir 分析结果\\2026-05-14_exp11_weekly_periodic_features_hist168_pred6_seed0_feb2026_holdout"
+  },
+  "wandb_context": {
+    "entity": "trumanmcmichael62-huaqiao-university",
+    "project": "top150_rolling6h_model_compare",
+    "realtime_training": "以后跑实验默认使用 --logger wandb --wandb_project top150_rolling6h_model_compare --wandb_run_name <清晰名称>",
+    "watch_chart": "W&B workspace 中看 val_mae_epoch / val_loss_epoch / train_loss_epoch；正式对比可看 epoch/val_mae 或 holdout summary",
+    "notes": [
+      "之前 W&B 因脚本设置 WANDB_MODE=offline 导致网页看不到，已修复",
+      "update_exp10_fast_holdout_wandb_summary.py 两次联网写入 W&B API 超时，但 dry-run payload 正常",
+      "Project Workspace 不需要提前手动创建，第一次 sync 会自动创建"
+    ]
+  },
+  "github_upload_advice": {
+    "status": "用户询问过如何上传 GitHub，尚未实际生成 .gitignore/README",
+    "recommended_gitignore": [
+      "data/",
+      "logs/",
+      "wandb/",
+      "*.ckpt",
+      "*.npz",
+      "*.npy",
+      "*.csv",
+      "__pycache__/",
+      "*.pyc"
+    ],
+    "recommended_upload_content": [
+      "版本管理/",
+      "models/",
+      "datasets/",
+      "README.md",
+      ".gitignore",
+      "分析结果/CURRENT_PREDICTION_MAINLINE.md",
+      "少量对比图 PNG/SVG"
+    ],
+    "basic_commands": [
+      "git status",
+      "git init",
+      "git add .",
+      "git commit -m \"initial project code\"",
+      "git remote add origin https://github.com/<username>/<repo>.git",
+      "git branch -M main",
+      "git push -u origin main"
+    ]
+  },
+  "conceptual_conclusions": {
+    "prediction_vs_dispatch": "当前阶段优先预测实验；调度后续再做，预测结果可转库存轨迹、风险标签、调度输入",
+    "rolling_anchor_meaning": "不是只预测凌晨 0 点后的 6 小时，而是在 00/06/12/16/20 等多个实际决策时刻分别预测未来 6 小时，更接近现实调度/运营",
+    "long_term_question": "pred_len=6 属于短中期滚动预测；之前 24h 模型是长时预测。当前更偏真实调度/运营，但仍可解释为 rolling multi-step forecasting",
+    "hist168_reason": "168 小时天然包含一周周期；hist336 变差说明简单加长窗口不一定有效",
+    "weekly_feature_reason": "exp11 不把窗口拉长，而显式加入前一天/上一周同目标小时特征，试图增强周期先验且减少噪声",
+    "distri_reason": "no_distri 变差说明需求相关图 distri 和 OD 图不完全冗余，应保留",
+    "current_best_direction": "保留 exp10_fast 结构，先验证 exp11 周周期特征；若 exp11 提升，再考虑 seed1 和主线更新"
+  },
+  "next_recommended_steps": [
+    {
+      "step": 1,
+      "action": "运行 exp11_train_seed0 命令",
+      "purpose": "验证显式日/周周期特征是否提升当前主线"
+    },
+    {
+      "step": 2,
+      "action": "运行 exp11_eval_seed0 命令",
+      "purpose": "得到 Feb 2026 外部 holdout MAE/RMSE"
+    },
+    {
+      "step": 3,
+      "action": "对比 exp11 与 exp10_fast seed0/seed1 平均 MAE=1.9942",
+      "decision_rule": {
+        "exp11_mae_lt_1_9942": "周期特征有效，考虑作为新主线并跑 seed1",
+        "exp11_mae_1_99_to_2_03": "基本持平，说明 hist168 已学到大部分周期",
+        "exp11_mae_gt_2_05": "周期特征增加噪声，不作为主线"
+      }
+    },
+    {
+      "step": 4,
+      "action": "若 exp11 有效，更新 CURRENT_PREDICTION_MAINLINE.md、对比 CSV 和图"
+    },
+    {
+      "step": 5,
+      "action": "之后再考虑 OD 图压缩或模型结构轻量化；不要先删 distri"
+    }
+  ]
+}

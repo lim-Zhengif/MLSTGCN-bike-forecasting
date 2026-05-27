@@ -1,0 +1,500 @@
+{
+  "summary_version": "2026-04-16_session_resume_v1",
+  "language": "zh-CN",
+  "current_date": "2026-04-16",
+  "environment": {
+    "os_shell": "powershell",
+    "timezone": "Asia/Shanghai",
+    "repo_root": "E:/学校/毕业设计/开题报告相关论文/多图/动态多图/MLSTGCN-master/MLSTGCN-master",
+    "active_version_dir": "版本管理/2026-04-09_小时级骑入骑出_安全库存区间"
+  },
+  "user_preferences": {
+    "preferred_language": "Chinese",
+    "style": "practical, structured, explicit paths/commands, experimental rigor",
+    "wants": [
+      "实验命令和结果可回溯",
+      "版本化管理",
+      "尽量少手改源码、更多通过命令行控制",
+      "保留训练/评估/报告链路的一致性",
+      "后续容易查阅和复现实验"
+    ],
+    "dislikes": [
+      "隐式逻辑不清楚",
+      "不知道当前脚本默认到底对应哪个实验",
+      "实验结果和代码版本不一致"
+    ]
+  },
+  "assistant_behavior_contract": {
+    "high_level": [
+      "以代码协作代理身份工作，优先直接实现，不只做口头建议",
+      "先看代码再下结论",
+      "编辑文件时使用 apply_patch",
+      "避免覆盖/回滚用户已有改动",
+      "优先用 rg 搜索",
+      "中间进度更新简短明确",
+      "最终回答简洁但保留关键结论和路径"
+    ],
+    "important_note": "此字段是对最初系统/开发提示的高层摘要，不是逐字转录。"
+  },
+  "main_objective": {
+    "theme": "小时级共享单车骑入/骑出预测 + 安全库存区间 + 调度应用",
+    "current_focus": [
+      "通过小时级 MSTGCN/FusionGraph 实验优化预测效果",
+      "规范训练入口、命令记录和实验回顾",
+      "让下游 evaluate/report 正确关联到对应实验",
+      "补充假设性调度仿真工具",
+      "准备后续做外部论文/基线对比"
+    ]
+  },
+  "important_paths": {
+    "train_core": "版本管理/2026-04-09_小时级骑入骑出_安全库存区间/train_bike.py",
+    "train_hourly_wrapper": "版本管理/2026-04-09_小时级骑入骑出_安全库存区间/train_bike_hourly.py",
+    "train_hourly_exp06_preset": "版本管理/2026-04-09_小时级骑入骑出_安全库存区间/train_bike_hourly_exp06.py",
+    "eval_hourly": "版本管理/2026-04-09_小时级骑入骑出_安全库存区间/evaluate_bike_hourly_date_range.py",
+    "report_safe_inventory": "版本管理/2026-04-09_小时级骑入骑出_安全库存区间/generate_bike_safe_inventory_interval_report.py",
+    "review_script": "版本管理/2026-04-09_小时级骑入骑出_安全库存区间/analyze_hourly_results_review.py",
+    "versioned_mstgcn": "版本管理/2026-04-09_小时级骑入骑出_安全库存区间/models/MSTGCN.py",
+    "versioned_fusiongraph": "版本管理/2026-04-09_小时级骑入骑出_安全库存区间/models/fusiongraph.py",
+    "latest_training_record": "版本管理/2026-04-09_小时级骑入骑出_安全库存区间/latest_hourly_training_checkpoint.json",
+    "route_doc": "分析结果/2026-04-09_小时级骑入骑出_安全库存区间/后续路线与新增参数说明_2026-04-14.md",
+    "command_history_doc": "分析结果/2026-04-09_小时级骑入骑出_安全库存区间/实验命令登记表.md",
+    "preset_history_doc": "分析结果/2026-04-09_小时级骑入骑出_安全库存区间/exp06预设入口与历史命令回顾_2026-04-15.md",
+    "simulation_dir": "分析结果/2026-04-09_小时级骑入骑出_安全库存区间/假设性仿真"
+  },
+  "major_resolved_topics": [
+    {
+      "topic": "最优模型选择逻辑",
+      "resolution": "训练已改为真正按 val_mae_epoch 选 best checkpoint，而不是旧的命名/监控混乱逻辑。",
+      "implication": "旧实验若要公平比较，最好按新逻辑重跑；evaluate/report 理应围绕 best.ckpt 而非 last.ckpt。"
+    },
+    {
+      "topic": "为什么曾建议先看 last.ckpt",
+      "resolution": "只是为了快速核对最终训练走向和当前轮状态，不是正式实验结果的首选模型。",
+      "implication": "正式比较仍应以 best.ckpt 为准。"
+    },
+    {
+      "topic": "train_bike_hourly.py 默认是否等于 exp06",
+      "resolution": "否。它只是小时级通用包装器，默认注入 data_dir/graph_dir/pred_len/hist_len/batch_size/project 等小时级基础值，不等于 exp06。",
+      "implication": "若要直接复现当前最优候选，应使用 train_bike_hourly_exp06.py。"
+    },
+    {
+      "topic": "训练脚本与版本目录模型文件不一致导致报错",
+      "resolution": "出现过一次 train_bike.py 已支持 cheb_k/nb_block 等新参数，但版本目录里的 models/MSTGCN.py 仍是旧版，导致 TypeError: unexpected keyword argument 'cheb_k'。该问题已修复。",
+      "implication": "以后改当前版本训练链路时，要优先同步当前版本目录下的 models/，而不是只改仓库根目录 models/。"
+    }
+  ],
+  "training_entry_points": {
+    "train_bike_py_role": "底层通用训练入口，持有通用 parser 默认值",
+    "train_bike_hourly_py_role": "小时级包装器，会补充小时级任务默认值并把其余参数透传给 train_bike.py",
+    "train_bike_hourly_exp06_py_role": "当前最优候选 exp06 的预设入口，可直接复现 exp06 或在其基础上覆盖少量参数",
+    "argument_precedence": [
+      "1. 用户在命令行显式传入的值",
+      "2. train_bike_hourly.py 或 train_bike_hourly_exp06.py 注入的默认值",
+      "3. train_bike.py 内部 parser 的底层默认值"
+    ],
+    "example_epochs_resolution": {
+      "train_bike_py_default": 40,
+      "train_bike_hourly_injected_default": 60,
+      "effective_when_running_train_bike_hourly_without_epochs": 60
+    }
+  },
+  "cli_parameters_added_or_exposed": {
+    "earlier_batch": [
+      "--graph_use",
+      "--graph_attention",
+      "--matrix_weight",
+      "--graph_fix_weight",
+      "--tempp_diag_zero",
+      "--graph_distri_type",
+      "--graph_func_type",
+      "--fusion_heads",
+      "--fusion_head_dim",
+      "--bn_decay",
+      "--cheb_k",
+      "--nb_block",
+      "--nb_chev_filter",
+      "--nb_time_filter",
+      "--weekday_embed_dim"
+    ],
+    "later_batch": [
+      "--seed",
+      "--num_workers",
+      "--precision",
+      "--grad_clip_val",
+      "--monitor_metric",
+      "--monitor_mode",
+      "--graph_sparsify_symmetric",
+      "--graph_sparsify_keep_self",
+      "--output_constraint",
+      "--output_softplus_beta",
+      "--time_kernel_size"
+    ],
+    "note": "这些参数大多原本是源码写死或未暴露；现在可以直接写在 python 命令后。train_bike.py 和 train_bike_hourly.py 中已补 help/注释。"
+  },
+  "key_code_changes": [
+    {
+      "files": [
+        "版本管理/2026-04-09_小时级骑入骑出_安全库存区间/train_bike.py"
+      ],
+      "changes": [
+        "扩展 parser，暴露大量训练/图配置/MSTGCN 结构参数",
+        "支持 monitor_metric/monitor_mode，best checkpoint 文件名跟随监控指标变化",
+        "支持 precision 和 gradient_clip_val",
+        "支持 output_constraint=softplus/relu/none 与 output_softplus_beta",
+        "DataLoader 支持 num_workers",
+        "seed 从命令行读取",
+        "graph_sparsify_symmetric/graph_sparsify_keep_self 可控",
+        "time_kernel_size 透传到 MSTGCN"
+      ]
+    },
+    {
+      "files": [
+        "版本管理/2026-04-09_小时级骑入骑出_安全库存区间/models/MSTGCN.py",
+        "models/MSTGCN.py"
+      ],
+      "changes": [
+        "MSTGCN_submodule 支持 cheb_k/nb_block/nb_chev_filter/nb_time_filter/time_kernel_size",
+        "MSTGCN_block 的时间卷积核改为可配置 time_kernel_size，且要求为奇数"
+      ]
+    },
+    {
+      "files": [
+        "版本管理/2026-04-09_小时级骑入骑出_安全库存区间/train_bike_hourly.py"
+      ],
+      "changes": [
+        "补充注释说明其只是小时级包装器，额外参数会原样透传给 train_bike.py"
+      ]
+    },
+    {
+      "files": [
+        "版本管理/2026-04-09_小时级骑入骑出_安全库存区间/train_bike_hourly_exp06.py"
+      ],
+      "changes": [
+        "新增 exp06 预设入口，默认复现当前最佳候选配置 topk20 + lr5e-5 + huber2"
+      ]
+    },
+    {
+      "files": [
+        "分析结果/2026-04-09_小时级骑入骑出_安全库存区间/后续路线与新增参数说明_2026-04-14.md",
+        "分析结果/2026-04-09_小时级骑入骑出_安全库存区间/exp06预设入口与历史命令回顾_2026-04-15.md"
+      ],
+      "changes": [
+        "更新路线与参数说明",
+        "新增 exp06 预设入口使用说明",
+        "整理 exp01-exp07 历史训练命令回顾"
+      ]
+    },
+    {
+      "files": [
+        "分析结果/2026-04-09_小时级骑入骑出_安全库存区间/假设性仿真/小时级仿真调度过程说明.md",
+        "分析结果/2026-04-09_小时级骑入骑出_安全库存区间/假设性仿真/simulate_hourly_dispatch.py"
+      ],
+      "changes": [
+        "新增假设性调度仿真文档",
+        "新增可执行仿真脚本，可基于已有 hourly predictions 和 safe inventory report 做小时级滚动调度模拟"
+      ]
+    }
+  ],
+  "simulation_module": {
+    "purpose": "把预测结果转成调度决策，再用真实流量回放，判断预测是否真正有调度价值。",
+    "location": "分析结果/2026-04-09_小时级骑入骑出_安全库存区间/假设性仿真",
+    "inputs": [
+      "station_hourly_predictions.csv",
+      "safe_inventory_interval_report.csv"
+    ],
+    "outputs": [
+      "simulation_station_hourly.csv",
+      "dispatch_moves.csv",
+      "simulation_summary.json",
+      "excluded_stations_missing_info.csv"
+    ],
+    "default_behavior": [
+      "优先尝试自动定位最近实验对应的评估结果",
+      "如果最近实验缺评估结果，会回退到已有 exp03 示例目录"
+    ],
+    "simplifying_assumptions": [
+      "按小时聚合流量",
+      "调度当小时立即生效",
+      "不建模调度路径和行驶时间",
+      "允许调度中心作为兜底来源/去向"
+    ],
+    "sample_run": {
+      "date": "2026-02-01",
+      "eval_source": "分析结果/2026-04-09_小时级骑入骑出_安全库存区间/小时级滚动预测_2026-02-01_到_2026-02-10_bike_hourly_safe_inventory_exp03_lr5e5_huber2",
+      "summary": {
+        "station_count": 96,
+        "excluded_station_count": 9,
+        "planned_dispatch_bikes": 14.0,
+        "real_executed_dispatch_bikes": 14.0,
+        "baseline_unmet_demand_bikes": 0.0,
+        "simulation_unmet_demand_bikes": 4.0,
+        "baseline_overflow_bikes": 0.0,
+        "simulation_overflow_bikes": 0.0
+      },
+      "interpretation": "这套简单调度规则并不保证一定变好；在该样例上调度后反而增加缺车损失，说明仿真框架具有判别力。"
+    }
+  },
+  "experiment_registry": [
+    {
+      "id": "default_hourly",
+      "project": "bike_hourly_safe_inventory_default_lr1e4",
+      "entry_command": "python 版本管理/2026-04-09_小时级骑入骑出_安全库存区间/train_bike_hourly.py",
+      "notes": "只是小时级通用默认入口，不代表最优实验。"
+    },
+    {
+      "id": "exp01_lr5e5",
+      "project": "bike_hourly_safe_inventory_exp01_lr5e5",
+      "entry_command": "python 版本管理/2026-04-09_小时级骑入骑出_安全库存区间/train_bike_hourly.py --device auto --logger csv --epochs 60 --batch_size 8 --lr 5e-5 --weight_decay 1e-4 --early_stop_patience 8 --lr_patience 3 --lr_factor 0.5 --min_lr 1e-6 --project bike_hourly_safe_inventory_exp01_lr5e5",
+      "historical_note": "曾发现 best 选择逻辑与 val_mae_epoch 不一致，后续已修正并建议相关实验按新逻辑重跑。",
+      "rerun_fixed_logic_snapshot": {
+        "best_checkpoint": "logs/bike_hourly_safe_inventory_exp01_lr5e5/version_1/checkpoints/best-epoch=27-val_mae_epoch=0.8576.ckpt",
+        "test_mae": 0.5946829319000244,
+        "best_val_mae_epoch": 0.8576
+      },
+      "status": "已被更优实验超过"
+    },
+    {
+      "id": "exp02_lr2e4",
+      "project": "bike_hourly_safe_inventory_exp02_lr2e4",
+      "entry_command": "python 版本管理/2026-04-09_小时级骑入骑出_安全库存区间/train_bike_hourly.py --device auto --logger auto --epochs 60 --batch_size 8 --lr 2e-4 --weight_decay 1e-4 --early_stop_patience 8 --lr_patience 3 --lr_factor 0.5 --min_lr 1e-6 --project bike_hourly_safe_inventory_exp02_lr2e4",
+      "results": {
+        "best_val_mae_epoch": 1.1491,
+        "test_mae": 0.6875040531158447,
+        "test_loss": 0.9366618394851685
+      },
+      "status": "明显较差，排除"
+    },
+    {
+      "id": "exp03_huber2_lr1e4",
+      "project": "bike_hourly_safe_inventory_exp03_huber2",
+      "entry_command": "python 版本管理/2026-04-09_小时级骑入骑出_安全库存区间/train_bike_hourly.py --device auto --logger csv --epochs 60 --batch_size 8 --lr 1e-4 --weight_decay 1e-4 --loss huber --huber_delta 2.0 --early_stop_patience 8 --lr_patience 3 --project bike_hourly_safe_inventory_exp03_huber2",
+      "status": "过渡实验，非当前主线"
+    },
+    {
+      "id": "exp03_lr5e5_huber2",
+      "project": "bike_hourly_safe_inventory_exp03_lr5e5_huber2",
+      "entry_command": "python 版本管理/2026-04-09_小时级骑入骑出_安全库存区间/train_bike_hourly.py --device auto --logger auto --epochs 60 --batch_size 8 --lr 5e-5 --weight_decay 1e-4 --loss huber --huber_delta 2.0 --early_stop_patience 8 --lr_patience 3 --lr_factor 0.5 --min_lr 1e-6 --project bike_hourly_safe_inventory_exp03_lr5e5_huber2",
+      "results": {
+        "best_val_mae_epoch": 0.8449444770812988,
+        "test_mae": 0.5866608023643494,
+        "test_loss": 0.5166139006614685,
+        "best_checkpoint": "wandb/offline-run-20260413_172034-76a0k9es/files/bike_hourly_safe_inventory_exp03_lr5e5_huber2/76a0k9es/checkpoints/best-epoch=59-val_mae_epoch=0.8449.ckpt"
+      },
+      "status": "稳健参考基线",
+      "notes": [
+        "曾作为主线候选",
+        "现在仍建议保留为简洁稳定 baseline"
+      ]
+    },
+    {
+      "id": "exp04_ep90",
+      "project": "bike_hourly_safe_inventory_exp04_lr5e5_huber2_ep90",
+      "entry_command": "python 版本管理/2026-04-09_小时级骑入骑出_安全库存区间/train_bike_hourly.py --device auto --logger auto --epochs 90 --batch_size 8 --lr 5e-5 --weight_decay 1e-4 --loss huber --huber_delta 2.0 --early_stop_patience 8 --lr_patience 3 --lr_factor 0.5 --min_lr 1e-6 --project bike_hourly_safe_inventory_exp04_lr5e5_huber2_ep90",
+      "results": {
+        "best_val_mae_epoch": 0.845921516418457,
+        "test_mae": 0.5871143341064453,
+        "test_loss": 0.5159397721290588
+      },
+      "status": "加轮次无明显收益"
+    },
+    {
+      "id": "exp05_topk10",
+      "project": "bike_hourly_safe_inventory_exp05_lr5e5_huber2_topk10",
+      "entry_command": "python 版本管理/2026-04-09_小时级骑入骑出_安全库存区间/train_bike_hourly.py --device auto --logger auto --epochs 60 --batch_size 8 --lr 5e-5 --weight_decay 1e-4 --loss huber --huber_delta 2.0 --early_stop_patience 8 --lr_patience 3 --lr_factor 0.5 --min_lr 1e-6 --graph_sparsify_mode topk --graph_topk 10 --project bike_hourly_safe_inventory_exp05_lr5e5_huber2_topk10",
+      "results": {
+        "best_val_mae_epoch": 0.8609773516654968,
+        "test_mae": 0.5880948901176453,
+        "test_loss": 0.5286317467689514
+      },
+      "status": "图裁得过稀，不优"
+    },
+    {
+      "id": "exp06_topk20",
+      "project": "bike_hourly_safe_inventory_exp06_lr5e5_huber2_topk20",
+      "entry_command": "python 版本管理/2026-04-09_小时级骑入骑出_安全库存区间/train_bike_hourly.py --device auto --logger auto --epochs 60 --batch_size 8 --lr 5e-5 --weight_decay 1e-4 --loss huber --huber_delta 2.0 --early_stop_patience 8 --lr_patience 3 --lr_factor 0.5 --min_lr 1e-6 --graph_sparsify_mode topk --graph_topk 20 --project bike_hourly_safe_inventory_exp06_lr5e5_huber2_topk20",
+      "equivalent_preset_entry": "python 版本管理/2026-04-09_小时级骑入骑出_安全库存区间/train_bike_hourly_exp06.py",
+      "results": {
+        "best_val_mae_epoch": 0.8464149832725525,
+        "test_mae": 0.585685670375824,
+        "test_loss": 0.5144479274749756,
+        "best_checkpoint": "wandb/offline-run-20260414_145252-l5at2ion/files/bike_hourly_safe_inventory_exp06_lr5e5_huber2_topk20/l5at2ion/checkpoints/best-epoch=59-val_mae_epoch=0.8464.ckpt"
+      },
+      "status": "当前按 test_mae 最优候选",
+      "recommendation": "保留为当前主线精度最优候选"
+    },
+    {
+      "id": "exp07_topk15_or_rowmean",
+      "project": "bike_hourly_safe_inventory_exp07_lr5e5_huber2_topk15_or_rowmean",
+      "entry_command": "python 版本管理/2026-04-09_小时级骑入骑出_安全库存区间/train_bike_hourly.py --device auto --logger auto --epochs 60 --batch_size 8 --lr 5e-5 --weight_decay 1e-4 --loss huber --huber_delta 2.0 --early_stop_patience 8 --lr_patience 3 --lr_factor 0.5 --min_lr 1e-6 --graph_sparsify_mode topk_or_row_mean --graph_topk 15 --project bike_hourly_safe_inventory_exp07_lr5e5_huber2_topk15_or_rowmean",
+      "results": {
+        "best_val_mae_epoch": 0.8462774753570557,
+        "test_mae": 0.5888352394104004,
+        "test_loss": 0.5139195322990417,
+        "best_checkpoint": "wandb/offline-run-20260414_175512-cu59nd4k/files/bike_hourly_safe_inventory_exp07_lr5e5_huber2_topk15_or_rowmean/cu59nd4k/checkpoints/best-epoch=52-val_mae_epoch=0.8463.ckpt"
+      },
+      "status": "未超过 exp06",
+      "interpretation": "topk_or_row_mean + topk15 没有带来主线收益，图裁剪这条线可以先收束。"
+    },
+    {
+      "id": "exp08_topk20_noattn",
+      "project": "bike_hourly_safe_inventory_exp08_topk20_noattn",
+      "entry_command": "python 版本管理/2026-04-09_小时级骑入骑出_安全库存区间/train_bike_hourly_exp06.py --graph_attention false --project bike_hourly_safe_inventory_exp08_topk20_noattn",
+      "resolved_train_command": "python 版本管理/2026-04-09_小时级骑入骑出_安全库存区间/train_bike.py --data_dir data/temporal_data/bike_hourly_safe_inventory --graph_dir data/graph/bike_hourly_safe_inventory --pred_len 24 --hist_len 168 --batch_size 8 --device auto --logger auto --epochs 60 --lr 5e-5 --weight_decay 1e-4 --loss huber --huber_delta 2.0 --early_stop_patience 8 --lr_patience 3 --lr_factor 0.5 --min_lr 1e-6 --graph_sparsify_mode topk --graph_topk 20 --graph_attention false --project bike_hourly_safe_inventory_exp08_topk20_noattn",
+      "results": {
+        "best_val_mae_epoch": 0.8499068021774292,
+        "test_mae": 0.5916923880577087,
+        "test_loss": 0.5138596296310425,
+        "rmse_avg": 1.1044,
+        "best_checkpoint": "wandb/offline-run-20260415_213129-bs54jn83/files/bike_hourly_safe_inventory_exp08_topk20_noattn/bs54jn83/checkpoints/best-epoch=52-val_mae_epoch=val_mae_epoch=0.8499.ckpt"
+      },
+      "status": "不建议替代 exp06",
+      "interpretation": [
+        "关闭图注意力后 test_mae 明显变差（相对 exp06 约 +0.0060）",
+        "test_loss 与 rmse 仍接近前几组，说明它可能更平滑/更保守，但平均绝对误差更差",
+        "适合作为结构消融实验保留，不适合作为主线最优"
+      ]
+    }
+  ],
+  "best_current_choice": {
+    "best_by_test_mae": "bike_hourly_safe_inventory_exp06_lr5e5_huber2_topk20",
+    "best_by_test_mae_value": 0.585685670375824,
+    "stable_baseline": "bike_hourly_safe_inventory_exp03_lr5e5_huber2",
+    "stable_baseline_test_mae": 0.5866608023643494,
+    "current_experimental_direction_status": {
+      "lr_scan": "已完成，5e-5 优于 2e-4",
+      "huber2": "有效，形成主线",
+      "extra_epochs_90": "收益很小",
+      "graph_sparsify_topk10": "不优",
+      "graph_sparsify_topk20": "当前最好",
+      "topk_or_row_mean_topk15": "未超过 topk20",
+      "graph_attention_off": "不优于 attention on"
+    }
+  },
+  "documents_created_or_updated": [
+    {
+      "path": "分析结果/2026-04-09_小时级骑入骑出_安全库存区间/后续路线与新增参数说明_2026-04-14.md",
+      "purpose": "总结当前状态、参数含义、后续实验路线"
+    },
+    {
+      "path": "分析结果/2026-04-09_小时级骑入骑出_安全库存区间/实验命令登记表.md",
+      "purpose": "登记实验命令（早期文档，后续更完整历史已写入新文档）"
+    },
+    {
+      "path": "分析结果/2026-04-09_小时级骑入骑出_安全库存区间/实验结果命名规范.md",
+      "purpose": "统一命名规则"
+    },
+    {
+      "path": "分析结果/2026-04-09_小时级骑入骑出_安全库存区间/exp06预设入口与历史命令回顾_2026-04-15.md",
+      "purpose": "说明 train_bike_hourly_exp06.py 的用途，并回顾 exp01-exp07 关键命令"
+    }
+  ],
+  "downstream_pipeline_behavior": {
+    "evaluate_bike_hourly_date_range_py": {
+      "core_decision": "先决定使用哪个 checkpoint",
+      "selection_priority": [
+        "如果显式传 --checkpoint，则直接使用该 checkpoint",
+        "若未显式传 --project，则优先读取 latest_hourly_training_checkpoint.json 中的 preferred_checkpoint/best_checkpoint/last_checkpoint",
+        "若记录文件失效，则自动搜索全局最新 checkpoint",
+        "若显式传 --project，则按该 project 名搜索最新 checkpoint"
+      ],
+      "output_behavior": [
+        "自动生成输出目录（含日期范围和实验 tag）",
+        "输出 station_hourly_predictions.csv / daily_metrics.csv / hourly_metrics.csv / summary.json",
+        "summary.json 会写入 checkpoint、checkpoint_source、checkpoint_project、experiment_tag 等"
+      ],
+      "important_caveat": "当前 evaluate 脚本虽然能选到正确 checkpoint，但并不会完整恢复训练时所有结构超参数。它在推理里仍硬编码了部分配置，例如 attention=True、matrix_weight=True、graph_use 全开等。对 exp08 这类 graph_attention=false 的实验，若直接评估，可能选到对的 checkpoint 但用错推理配置。"
+    },
+    "generate_bike_safe_inventory_interval_report_py": {
+      "core_decision": "不直接选 checkpoint，而是决定要处理哪个 eval_dir",
+      "selection_priority": [
+        "如果显式传 --eval_dir，则直接使用该评估结果目录",
+        "否则自动扫描分析结果目录下最新的 station_hourly_predictions.csv 所在目录"
+      ],
+      "dependency": "必须先有 evaluate 生成的 station_hourly_predictions.csv",
+      "output_behavior": [
+        "在 eval_dir 下生成 safe_inventory_interval_report.csv",
+        "生成 safe_inventory_interval_summary.json，并写入 checkpoint_project/checkpoint/version_tag 等信息"
+      ]
+    },
+    "analyze_hourly_results_review_py": {
+      "role": "对比评估结果并生成 review 目录/markdown/json 总结",
+      "known_note": "用户提过 wandb 日志摘要指错 run 的问题，后续已修过相关逻辑（细节无需默认重做，除非再次出现）。"
+    },
+    "recommended_safe_usage": [
+      "若要严格评估某个实验，最好显式传 --checkpoint 或 --project 给 evaluate",
+      "再显式传 --eval_dir 给 generate",
+      "对非默认结构实验（如 noattn），在修复 evaluate 自动继承训练超参数前，不应盲目相信 downstream 评估结果"
+    ]
+  },
+  "known_issues_and_caveats": [
+    {
+      "issue": "evaluate_bike_hourly_date_range.py 未自动继承训练时的全部结构/图配置",
+      "impact": "像 exp08_noattn 这类实验可能 checkpoint 正确但推理配置错误",
+      "priority": "high",
+      "recommended_fix": "让 evaluate 从 training_summary.json 或 checkpoint 旁的元数据中自动恢复 graph_attention、graph_use、matrix_weight、sparsify config、weekday_embed_dim、time_kernel_size 等"
+    },
+    {
+      "issue": "best checkpoint 文件名目前会出现 best-epoch=52-val_mae_epoch=val_mae_epoch=0.8499.ckpt 这样的重复字段",
+      "impact": "不影响训练结果，但命名略丑且容易混淆",
+      "priority": "low",
+      "recommended_fix": "调整 ModelCheckpoint filename 模板，避免 monitor metric 名称重复出现在文件名中"
+    },
+    {
+      "issue": "分析注册表 Excel 导出依赖 openpyxl",
+      "impact": "若环境缺失 openpyxl，会跳过 Excel 导出，仅保留 JSON/CSV/控制台记录",
+      "priority": "medium"
+    }
+  ],
+  "important_concepts_explained_to_user": [
+    {
+      "concept": "为什么小时级预测比日级预测更有调度价值",
+      "summary": [
+        "日级预测更适合运营统计",
+        "小时级预测能回答什么时候开始缺车/满桩",
+        "能提前 1-3 小时做滚动预警和小步调度"
+      ]
+    },
+    {
+      "concept": "train_bike.py vs train_bike_hourly.py",
+      "summary": [
+        "train_bike.py 是底层总开关",
+        "train_bike_hourly.py 是小时级包装器",
+        "train_bike_hourly_exp06.py 是当前最优配置的预设入口"
+      ]
+    },
+    {
+      "concept": "为什么 last.ckpt 不是正式主结论",
+      "summary": [
+        "last.ckpt 反映训练最后状态，适合调试",
+        "best.ckpt 才应该用于正式实验比较"
+      ]
+    }
+  ],
+  "external_comparison_strategy": {
+    "user_goal": "开始与他人单车预测方法做横向指标对比，同时内部继续少量高信息量实验，节省时间",
+    "advice_given": [
+      "现在已经到边际收益变小阶段，可并行开始外部论文/基线对比",
+      "内部不必继续死磕 topk_or_row_mean 这种微调",
+      "若做外部比较，务必尽量保证数据集/时间粒度/预测步长/评价指标口径一致"
+    ],
+    "recommended_internal_parallel_experiment_before_exp08_result": [
+      "在 exp06 基础上试 graph_attention=false（已完成为 exp08，结果不优）",
+      "在 exp06 基础上试图消融 graph_use dist,neighb,func（尚未正式跑）"
+    ]
+  },
+  "current_best_next_steps": [
+    "优先修复 evaluate_bike_hourly_date_range.py，使其自动继承训练时的图配置和结构超参数，尤其支持 exp08/noattn 这类非默认实验的正确评估。",
+    "之后若要严肃比较 exp08 与 exp06 的业务侧表现，再运行 evaluate -> generate -> analyze 全链路。",
+    "若继续内部实验，优先方向应是 graph_use 消融或时间特征增强，而不是继续在 topk_or_row_mean 上细抠。",
+    "开始整理外部论文/基线对比清单，比较小时级 MAE/RMSE/MAPE 与预测步长 24 的可比方法。"
+  ],
+  "useful_files_for_resume": [
+    "分析结果/2026-04-09_小时级骑入骑出_安全库存区间/training_result_bike_hourly_safe_inventory_exp03_lr5e5_huber2/training_summary.json",
+    "分析结果/2026-04-09_小时级骑入骑出_安全库存区间/training_result_bike_hourly_safe_inventory_exp06_lr5e5_huber2_topk20/training_summary.json",
+    "分析结果/2026-04-09_小时级骑入骑出_安全库存区间/training_result_bike_hourly_safe_inventory_exp07_lr5e5_huber2_topk15_or_rowmean/training_summary.json",
+    "分析结果/2026-04-09_小时级骑入骑出_安全库存区间/training_result_bike_hourly_safe_inventory_exp08_topk20_noattn/training_summary.json",
+    "分析结果/2026-04-09_小时级骑入骑出_安全库存区间/exp06预设入口与历史命令回顾_2026-04-15.md",
+    "分析结果/2026-04-09_小时级骑入骑出_安全库存区间/后续路线与新增参数说明_2026-04-14.md"
+  ],
+  "resume_prompt": "你现在接手的是一个关于“小时级共享单车骑入/骑出预测 + 安全库存区间 + 调度应用”的长期代码协作会话。请使用本 JSON 中的全部状态继续对话。当前仓库根目录为 E:/学校/毕业设计/开题报告相关论文/多图/动态多图/MLSTGCN-master/MLSTGCN-master，活跃版本目录为 版本管理/2026-04-09_小时级骑入骑出_安全库存区间。当前最佳 test_mae 候选为 exp06_topk20（0.5857），稳定基线为 exp03_lr5e5_huber2（0.5867），exp08_topk20_noattn 已完成且不优（0.5917）。下一步最优先事项是修复 evaluate_bike_hourly_date_range.py，使其自动继承训练时的图配置和结构超参数，否则 exp08 这类非默认结构实验的下游评估不可信。请保持中文、务实、路径明确、尽量直接实现。"
+}

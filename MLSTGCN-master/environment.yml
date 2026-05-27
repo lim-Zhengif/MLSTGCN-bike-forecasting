@@ -1,0 +1,13 @@
+name: mlstgcn_env
+channels:
+  - defaults
+dependencies:
+  - python=3.8
+  - pip
+  - numpy>=1.15
+  - scipy>=1.1.0
+  - pytorch=1.9.0
+  - torchvision
+  - torchaudio
+  - cudatoolkit=11.1
+  - pytorch-lightning=1.2.8

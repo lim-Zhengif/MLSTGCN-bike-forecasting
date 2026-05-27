@@ -1,0 +1,45 @@
+# IDE / Python cache
+.idea/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Python environments
+.venv/
+venv/
+env/
+
+# Large generated data and experiment artifacts
+MLSTGCN-master/data/
+MLSTGCN-master/logs/
+MLSTGCN-master/wandb/
+MLSTGCN-master/二月份数据处理/
+MLSTGCN-master/分析结果/
+
+# If scripts are run from the outer repo root, wandb may also appear here.
+wandb/
+
+# Model checkpoints and binary arrays
+*.ckpt
+*.pt
+*.pth
+*.npz
+*.npy
+
+# Raw / generated tabular data
+*.csv
+*.xlsx
+*.xls
+
+# Large archives
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+
+# OS files
+.DS_Store
+Thumbs.db
