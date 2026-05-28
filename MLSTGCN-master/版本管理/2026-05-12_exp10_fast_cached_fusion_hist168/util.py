@@ -92,12 +92,21 @@ class LightningMetric(Metric):
         dist_sync_fn: Callable = None,
         mape_eps: float = 1.0,
     ):
-        super().__init__(
-            compute_on_step=compute_on_step,
-            dist_sync_on_step=dist_sync_on_step,
-            process_group=process_group,
-            dist_sync_fn=dist_sync_fn,
-        )
+        try:
+            super().__init__(
+                compute_on_step=compute_on_step,
+                dist_sync_on_step=dist_sync_on_step,
+                process_group=process_group,
+                dist_sync_fn=dist_sync_fn,
+            )
+        except ValueError as exc:
+            if "Unexpected keyword arguments" not in str(exc):
+                raise
+            super().__init__(
+                dist_sync_on_step=dist_sync_on_step,
+                process_group=process_group,
+                dist_sync_fn=dist_sync_fn,
+            )
         self.add_state("y_true", default=[], dist_reduce_fx=None)
         self.add_state("y_pred", default=[], dist_reduce_fx=None)
         self.mape_eps = mape_eps
