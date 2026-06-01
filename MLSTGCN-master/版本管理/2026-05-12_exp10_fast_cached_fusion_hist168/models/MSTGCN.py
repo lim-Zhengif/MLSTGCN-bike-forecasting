@@ -183,7 +183,6 @@ class TrendAlignmentDecoder(nn.Module):
             embed_dim=attention_dim,
             num_heads=attention_heads,
             dropout=float(dropout),
-            batch_first=True,
         )
         self.residual_proj = nn.Linear(self.hidden_dim, attention_dim)
         self.output_proj = nn.Sequential(
@@ -233,7 +232,13 @@ class TrendAlignmentDecoder(nn.Module):
 
         flat_queries = queries.reshape(batch_size * num_nodes, self.num_for_predict, -1)
         flat_keys = keys.reshape(batch_size * num_nodes, hist_len, -1)
-        aligned, _ = self.attention(flat_queries, flat_keys, flat_keys, need_weights=False)
+        aligned, _ = self.attention(
+            flat_queries.transpose(0, 1),
+            flat_keys.transpose(0, 1),
+            flat_keys.transpose(0, 1),
+            need_weights=False,
+        )
+        aligned = aligned.transpose(0, 1)
         residual = self.residual_proj(final_hidden).reshape(batch_size * num_nodes, 1, -1)
         output = self.output_proj(aligned + residual)
         output = output.view(batch_size, num_nodes, self.num_for_predict, self.out_dim)
