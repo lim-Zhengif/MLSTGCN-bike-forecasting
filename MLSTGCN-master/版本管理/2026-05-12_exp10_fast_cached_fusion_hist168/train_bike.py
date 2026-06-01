@@ -202,6 +202,12 @@ parser.add_argument(
 )
 parser.add_argument('--channel_attention', default='false', help="Use 'true' or 'false' to enable channel attention in MSTGCN.")
 parser.add_argument('--channel_attention_reduction', type=int, default=4)
+parser.add_argument('--trend_alignment_decoder', default='false', help="Use 'true' or 'false' to enable the TSTAD-style trend-alignment parallel decoder.")
+parser.add_argument('--trend_time_feature_index', type=int, default=-1, help='Feature index for intra-day time ids. -1 means infer from input_feature_cols.')
+parser.add_argument('--trend_time_cycle', type=int, default=24, help='Number of intra-day slots, e.g. 24 for hourly or 48 for half-hourly data.')
+parser.add_argument('--trend_time_embed_dim', type=int, default=16)
+parser.add_argument('--trend_attention_heads', type=int, default=4)
+parser.add_argument('--trend_dropout', type=float, default=0.1)
 parser.add_argument('--d2_hidden_dim', type=int, default=64)
 parser.add_argument('--d2_num_layers', type=int, default=4)
 parser.add_argument('--d2_dropout', type=float, default=0.1)
@@ -283,6 +289,7 @@ args.graph_sparsify_keep_self = parse_bool_arg(args.graph_sparsify_keep_self, '-
 args.context_gate = parse_bool_arg(args.context_gate, '--context_gate')
 args.context_gate_anchor_hour = parse_bool_arg(args.context_gate_anchor_hour, '--context_gate_anchor_hour')
 args.anchor_homogeneous_batches = parse_bool_arg(args.anchor_homogeneous_batches, '--anchor_homogeneous_batches')
+args.trend_alignment_decoder = parse_bool_arg(args.trend_alignment_decoder, '--trend_alignment_decoder')
 args.channel_attention = parse_bool_arg(args.channel_attention, '--channel_attention')
 args.d2_adaptive_adj = parse_bool_arg(args.d2_adaptive_adj, '--d2_adaptive_adj')
 args.d2_use_reverse = parse_bool_arg(args.d2_use_reverse, '--d2_use_reverse')
@@ -318,6 +325,12 @@ if args.context_gate_scope == 'hard_anchor_od' and not args.anchor_homogeneous_b
     parser.error('--context_gate_scope hard_anchor_od requires --anchor_homogeneous_batches true for batch-level Cheb graphs.')
 if args.anchor_homogeneous_batches and not args.context_gate_anchor_hour:
     parser.error('--anchor_homogeneous_batches is intended for --context_gate_anchor_hour true.')
+if args.trend_time_cycle <= 0:
+    parser.error('--trend_time_cycle must be > 0.')
+if args.trend_time_embed_dim <= 0:
+    parser.error('--trend_time_embed_dim must be > 0.')
+if args.trend_attention_heads <= 0:
+    parser.error('--trend_attention_heads must be > 0.')
 if args.fusion_heads <= 0:
     parser.error('--fusion_heads must be > 0.')
 if args.fusion_head_dim <= 0:
@@ -416,6 +429,12 @@ hyperparameter_defaults = dict(
         time_kernel_size=args.time_kernel_size,
         channel_attention=args.channel_attention,
         channel_attention_reduction=args.channel_attention_reduction,
+        trend_alignment_decoder=args.trend_alignment_decoder,
+        trend_time_feature_index=args.trend_time_feature_index,
+        trend_time_cycle=args.trend_time_cycle,
+        trend_time_embed_dim=args.trend_time_embed_dim,
+        trend_attention_heads=args.trend_attention_heads,
+        trend_dropout=args.trend_dropout,
         d2_hidden_dim=args.d2_hidden_dim,
         d2_num_layers=args.d2_num_layers,
         d2_dropout=args.d2_dropout,
@@ -716,11 +735,46 @@ def resolve_anchor_hour_gate_stats(dataset, requested_index):
     }
 
 
+def resolve_trend_time_stats(dataset, requested_index, time_cycle):
+    feature_cols = getattr(dataset, 'input_feature_cols', [])
+    feature_mean = dataset.feature_mean.reshape(-1)
+    feature_std = dataset.feature_std.reshape(-1)
+    time_index = int(requested_index)
+    if time_index < 0:
+        if int(time_cycle) == 48:
+            preferred_tokens = ['日内半小时序号', '半小时序号', '半小时', 'slot']
+        else:
+            preferred_tokens = ['小时', 'hour']
+        for token in preferred_tokens:
+            for idx, feature_name in enumerate(feature_cols):
+                if token in feature_name and not feature_name.startswith('future_'):
+                    time_index = idx
+                    break
+            if time_index >= 0:
+                break
+    if time_index < 0 or time_index >= len(feature_mean):
+        parser.error('--trend_alignment_decoder could not infer the intra-day time feature; pass --trend_time_feature_index.')
+    return {
+        'trend_time_feature_index': time_index,
+        'trend_time_feature_mean': float(feature_mean[time_index]),
+        'trend_time_feature_std': float(feature_std[time_index] if feature_std[time_index] != 0 else 1.0),
+    }
+
+
 if config['graph']['context_gate_anchor_hour']:
     config['graph'].update(
         resolve_anchor_hour_gate_stats(
             train_set,
             requested_index=config['graph']['context_gate_anchor_hour_index'],
+        )
+    )
+
+if config['model']['trend_alignment_decoder']:
+    config['model'].update(
+        resolve_trend_time_stats(
+            train_set,
+            requested_index=config['model']['trend_time_feature_index'],
+            time_cycle=config['model']['trend_time_cycle'],
         )
     )
 
@@ -895,6 +949,14 @@ class LightningModel(LightningModule):
                 time_kernel_size=config['model']['time_kernel_size'],
                 channel_attention=config['model']['channel_attention'],
                 channel_attention_reduction=config['model']['channel_attention_reduction'],
+                trend_alignment_decoder=config['model']['trend_alignment_decoder'],
+                trend_time_feature_index=config['model']['trend_time_feature_index'],
+                trend_time_feature_mean=config['model'].get('trend_time_feature_mean', 0.0),
+                trend_time_feature_std=config['model'].get('trend_time_feature_std', 1.0),
+                trend_time_cycle=config['model']['trend_time_cycle'],
+                trend_time_embed_dim=config['model']['trend_time_embed_dim'],
+                trend_attention_heads=config['model']['trend_attention_heads'],
+                trend_dropout=config['model']['trend_dropout'],
             )
         elif config['model']['use'] == 'D2STGNN':
             self.model = D2STGNNFusionBackbone(

@@ -147,6 +147,99 @@ class ChannelAttention(nn.Module):
         return x * weights
 
 
+class TrendAlignmentDecoder(nn.Module):
+    def __init__(
+        self,
+        hidden_dim,
+        num_for_predict,
+        out_dim,
+        time_feature_index=-1,
+        time_feature_mean=0.0,
+        time_feature_std=1.0,
+        time_cycle=24,
+        time_embed_dim=16,
+        attention_heads=4,
+        dropout=0.1,
+    ):
+        super(TrendAlignmentDecoder, self).__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.num_for_predict = int(num_for_predict)
+        self.out_dim = int(out_dim)
+        self.time_feature_index = int(time_feature_index)
+        self.time_cycle = max(int(time_cycle), 1)
+        self.time_embed_dim = int(time_embed_dim)
+        attention_heads = max(int(attention_heads), 1)
+        self.register_buffer('time_feature_mean', torch.tensor(float(time_feature_mean), dtype=torch.float32))
+        self.register_buffer(
+            'time_feature_std',
+            torch.tensor(float(time_feature_std) if float(time_feature_std) != 0 else 1.0, dtype=torch.float32),
+        )
+
+        self.time_embedding = nn.Embedding(self.time_cycle, self.time_embed_dim)
+        attention_dim = self.hidden_dim + self.time_embed_dim
+        while attention_dim % attention_heads != 0 and attention_heads > 1:
+            attention_heads -= 1
+        self.attention = nn.MultiheadAttention(
+            embed_dim=attention_dim,
+            num_heads=attention_heads,
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.residual_proj = nn.Linear(self.hidden_dim, attention_dim)
+        self.output_proj = nn.Sequential(
+            nn.LayerNorm(attention_dim),
+            nn.Linear(attention_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.out_dim),
+        )
+        nn.init.xavier_uniform_(self.time_embedding.weight)
+
+    def _history_time_ids(self, context_x, hist_len):
+        # context_x is the raw scaled model input in (B, N, F, T).
+        if self.time_feature_index >= 0 and self.time_feature_index < context_x.shape[2]:
+            raw_time = (
+                context_x[:, :, self.time_feature_index, :] * self.time_feature_std
+                + self.time_feature_mean
+            )
+            return torch.remainder(raw_time.round().long(), self.time_cycle)
+        positions = torch.arange(hist_len, device=context_x.device, dtype=torch.long)
+        return positions.view(1, 1, hist_len).expand(context_x.shape[0], context_x.shape[1], hist_len)
+
+    def forward(self, hidden_sequence, context_x):
+        # hidden_sequence: (B, N, D, T), context_x: (B, N, F, T)
+        batch_size, num_nodes, hidden_dim, hist_len = hidden_sequence.shape
+        history_hidden = hidden_sequence.permute(0, 1, 3, 2)
+        final_hidden = history_hidden[:, :, -1, :]
+
+        history_time_ids = self._history_time_ids(context_x, hist_len)
+        future_offsets = torch.arange(
+            1,
+            self.num_for_predict + 1,
+            device=hidden_sequence.device,
+            dtype=torch.long,
+        ).view(1, 1, self.num_for_predict)
+        future_time_ids = torch.remainder(history_time_ids[:, :, -1:].long() + future_offsets, self.time_cycle)
+
+        history_time = self.time_embedding(history_time_ids)
+        future_time = self.time_embedding(future_time_ids)
+        keys = torch.cat([history_hidden, history_time], dim=-1)
+        queries = torch.cat(
+            [
+                final_hidden.unsqueeze(2).expand(-1, -1, self.num_for_predict, -1),
+                future_time,
+            ],
+            dim=-1,
+        )
+
+        flat_queries = queries.reshape(batch_size * num_nodes, self.num_for_predict, -1)
+        flat_keys = keys.reshape(batch_size * num_nodes, hist_len, -1)
+        aligned, _ = self.attention(flat_queries, flat_keys, flat_keys, need_weights=False)
+        residual = self.residual_proj(final_hidden).reshape(batch_size * num_nodes, 1, -1)
+        output = self.output_proj(aligned + residual)
+        output = output.view(batch_size, num_nodes, self.num_for_predict, self.out_dim)
+        return output.permute(0, 2, 1, 3)
+
+
 class cheb_conv(nn.Module):
     '''
     K-order chebyshev graph convolution
@@ -278,6 +371,14 @@ class MSTGCN_submodule(nn.Module):
         time_kernel_size=3,
         channel_attention=False,
         channel_attention_reduction=4,
+        trend_alignment_decoder=False,
+        trend_time_feature_index=-1,
+        trend_time_feature_mean=0.0,
+        trend_time_feature_std=1.0,
+        trend_time_cycle=24,
+        trend_time_embed_dim=16,
+        trend_attention_heads=4,
+        trend_dropout=0.1,
     ):
 
 
@@ -351,11 +452,26 @@ class MSTGCN_submodule(nn.Module):
             for _ in range(nb_block - 1)
         ])
 
-        self.final_conv = nn.Conv2d(
-            int(len_input / time_strides),
-            num_for_predict * out_dim,
-            kernel_size=(1, nb_time_filter),
-        )
+        self.use_trend_alignment_decoder = bool(trend_alignment_decoder)
+        if self.use_trend_alignment_decoder:
+            self.trend_decoder = TrendAlignmentDecoder(
+                hidden_dim=nb_time_filter,
+                num_for_predict=num_for_predict,
+                out_dim=out_dim,
+                time_feature_index=trend_time_feature_index,
+                time_feature_mean=trend_time_feature_mean,
+                time_feature_std=trend_time_feature_std,
+                time_cycle=trend_time_cycle,
+                time_embed_dim=trend_time_embed_dim,
+                attention_heads=trend_attention_heads,
+                dropout=trend_dropout,
+            )
+        else:
+            self.final_conv = nn.Conv2d(
+                int(len_input / time_strides),
+                num_for_predict * out_dim,
+                kernel_size=(1, nb_time_filter),
+            )
 
         self.DEVICE = DEVICE
         self.num_for_predict = num_for_predict
@@ -378,6 +494,9 @@ class MSTGCN_submodule(nn.Module):
 
         for block in self.BlockList:
             x = block(x, cheb_polynomials=cheb_polynomials)
+
+        if self.use_trend_alignment_decoder:
+            return self.trend_decoder(x, context_x)
 
         output = self.final_conv(x.permute(0, 3, 1, 2))[:, :, :, -1]
         batch_size, _, num_nodes = output.shape
