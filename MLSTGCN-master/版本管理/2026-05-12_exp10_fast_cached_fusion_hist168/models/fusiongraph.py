@@ -440,7 +440,12 @@ class FusionGraphModel(nn.Module):
                 prior_logits[local_idx] = self.context_gate_anchor_od_prior
         return prior_logits
 
-    def _extract_anchor_hour_ids(self, x):
+    def _extract_anchor_hour_ids(self, x, anchor_hours=None):
+        if anchor_hours is not None:
+            anchor_hours = anchor_hours.to(x.device).long()
+            if anchor_hours.dim() == 1:
+                return anchor_hours.view(-1, 1).expand(-1, x.shape[1])
+            return anchor_hours
         if (
             not self.context_gate_anchor_hour
             or not (0 <= self.context_gate_anchor_hour_index < x.shape[2])
@@ -450,7 +455,7 @@ class FusionGraphModel(nn.Module):
             x[:, :, self.context_gate_anchor_hour_index, -1] * self.context_gate_anchor_hour_std
             + self.context_gate_anchor_hour_mean
         )
-        return torch.remainder(last_history_hour.round().long() + 1, 24)
+        return torch.remainder(last_history_hour.round().long(), 24)
 
     def _hard_anchor_od_gate_weights(self, anchor_hour_ids):
         if anchor_hour_ids is None:
@@ -484,10 +489,10 @@ class FusionGraphModel(nn.Module):
         self.context_gate_for_run = display_weights
         return multipliers
 
-    def _context_gate_weights(self, x):
+    def _context_gate_weights(self, x, anchor_hours=None):
         if (not self.context_gate) or x is None:
             return None
-        anchor_hour_ids = self._extract_anchor_hour_ids(x)
+        anchor_hour_ids = self._extract_anchor_hour_ids(x, anchor_hours=anchor_hours)
         if self.context_gate_scope == 'hard_anchor_od':
             return self._hard_anchor_od_gate_weights(anchor_hour_ids)
 
@@ -529,13 +534,13 @@ class FusionGraphModel(nn.Module):
         self.context_gate_for_run = context_weights
         return context_weights
 
-    def forward(self, x=None):
+    def forward(self, x=None, anchor_hours=None):
 
         if self.graph.fix_weight:
             return self.graph.get_fix_weight()
 
         if self.fusion_graph:
-            context_weights = self._context_gate_weights(x)
+            context_weights = self._context_gate_weights(x, anchor_hours=anchor_hours)
             if not self.matrix_w:
                 self.A_w = self.softmax(self.adj_w)[0]
                 if context_weights is not None:

@@ -89,7 +89,9 @@ class EvalWrapper(nn.Module):
         else:
             raise NotImplementedError("Unsupported model_use: %s" % model_config.get("use"))
 
-    def forward(self, x):
+    def forward(self, x, anchor_hours=None):
+        if isinstance(self.model, MSTGCN_submodule):
+            return self.model(x, anchor_hours=anchor_hours)
         return self.model(x)
 
 
@@ -101,16 +103,20 @@ def resolve_device(device_arg):
 
 def load_npz_metadata(data_dir):
     train_npz = np.load(data_dir / "train.npz", allow_pickle=True)
+    train_x = train_npz["x"].astype(np.float32)
+    train_y = train_npz["y"].astype(np.float32)
+    feature_std = train_x.std(axis=(0, 1, 2), keepdims=True)
+    target_std = train_y.std(axis=(0, 1, 2), keepdims=True)
     return {
         "input_feature_cols": [str(v) for v in train_npz["input_feature_cols"].tolist()],
         "history_feature_cols": [str(v) for v in train_npz["history_feature_cols"].tolist()],
         "known_future_feature_cols": [str(v) for v in train_npz["known_future_feature_cols"].tolist()],
         "log1p_feature_cols": [str(v) for v in train_npz["log1p_feature_cols"].tolist()],
         "target_cols": [str(v) for v in train_npz["target_cols"].tolist()],
-        "feature_mean": train_npz["x"].mean(axis=(0, 1, 2), keepdims=True).astype(np.float32),
-        "feature_std": np.where(train_npz["x"].std(axis=(0, 1, 2), keepdims=True) == 0, 1.0, train_npz["x"].std(axis=(0, 1, 2), keepdims=True)).astype(np.float32),
-        "target_mean": train_npz["y"].mean(axis=(0, 1, 2), keepdims=True).astype(np.float32),
-        "target_std": np.where(train_npz["y"].std(axis=(0, 1, 2), keepdims=True) == 0, 1.0, train_npz["y"].std(axis=(0, 1, 2), keepdims=True)).astype(np.float32),
+        "feature_mean": train_x.mean(axis=(0, 1, 2), keepdims=True).astype(np.float32),
+        "feature_std": np.where(feature_std == 0, 1.0, feature_std).astype(np.float32),
+        "target_mean": train_y.mean(axis=(0, 1, 2), keepdims=True).astype(np.float32),
+        "target_std": np.where(target_std == 0, 1.0, target_std).astype(np.float32),
         "hist_len": int(train_npz["x"].shape[1]),
         "pred_len": int(train_npz["y"].shape[1]),
     }
@@ -645,7 +651,8 @@ def main():
     with torch.no_grad():
         for start in range(0, len(x_scaled), batch_size):
             batch = torch.from_numpy(x_scaled[start:start + batch_size]).to(device)
-            pred = model(batch)
+            anchor_batch = torch.from_numpy(sample_anchor_hours[start:start + batch_size]).to(device).long()
+            pred = model(batch, anchor_hours=anchor_batch)
             pred = pred * target_std + target_mean
             pred = F.softplus(pred, beta=5.0)
             preds.append(pred.cpu().numpy())

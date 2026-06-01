@@ -483,7 +483,7 @@ class MSTGCN_submodule(nn.Module):
         self.out_dim = out_dim
         self.to(self.DEVICE)
 
-    def forward(self, x):
+    def forward(self, x, anchor_hours=None):
         '''
         :param x: (B, N_nodes, F_in, T_in)
         :return: (B, N_nodes, T_out)
@@ -494,7 +494,7 @@ class MSTGCN_submodule(nn.Module):
         x = x.permute((0, 2, 3, 1))
         x = self.input_channel_attention(x)
 
-        adj_for_run = self.fusiongraph(context_x)
+        adj_for_run = self.fusiongraph(context_x, anchor_hours=anchor_hours)
         cheb_polynomials = self.BlockList[0].cheb_conv.build_cheb_polynomials(adj_for_run)
 
         for block in self.BlockList:

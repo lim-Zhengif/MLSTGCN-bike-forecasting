@@ -673,7 +673,11 @@ if not os.path.exists(args.graph_dir):
     )
 
 graph = BikeGraph(args.graph_dir, config['graph'], device)
-return_anchor = bool(config['train']['peak_anchor_loss_weight'] != 1.0)
+return_anchor = bool(
+    config['train']['peak_anchor_loss_weight'] != 1.0
+    or config['graph']['context_gate_anchor_hour']
+    or config['train']['anchor_homogeneous_batches']
+)
 train_set = Bike(args.data_dir, 'train', return_anchor=return_anchor)
 val_set = Bike(args.data_dir, 'val', return_anchor=return_anchor)
 test_set = Bike(args.data_dir, 'test', return_anchor=return_anchor)
@@ -996,7 +1000,9 @@ class LightningModel(LightningModule):
 
         self.log_dict(config)
 
-    def forward(self, x):
+    def forward(self, x, anchor_hours=None):
+        if config['model']['use'] == 'MSTGCN':
+            return self.model(x, anchor_hours=anchor_hours)
         return self.model(x)
 
     def _apply_output_constraint(self, y_hat):
@@ -1050,7 +1056,9 @@ class LightningModel(LightningModule):
             anchor_hours = None
         x = x.to(device).float()
         y = y.to(device).float()
-        y_hat = self(x)
+        if anchor_hours is not None:
+            anchor_hours = anchor_hours.to(device).long()
+        y_hat = self(x, anchor_hours=anchor_hours)
         y_hat = self.scaler.inverse_transform(y_hat)
         y_hat = self._apply_output_constraint(y_hat)
         loss = self._compute_loss(y_hat, y)
