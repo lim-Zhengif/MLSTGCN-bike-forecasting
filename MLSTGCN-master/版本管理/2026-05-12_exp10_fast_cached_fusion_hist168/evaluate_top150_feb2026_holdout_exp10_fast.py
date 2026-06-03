@@ -430,6 +430,14 @@ def main():
     parser.add_argument("--target_start_offset", type=int, default=1, help="For rolling anchors, decision t predicts t+offset...")
     parser.add_argument("--graph_use", default=None, help="Optional comma-separated graph list. Defaults to recovered training graph_use.")
     parser.add_argument("--batch_size", type=int, default=4, help="Evaluation batch size. Use 1 for batch-level dynamic graph gates.")
+    parser.add_argument("--context_gate", default=None, help="Optional true/false override for recovered context gate.")
+    parser.add_argument("--context_gate_hidden_dim", type=int, default=None)
+    parser.add_argument("--context_gate_residual", type=float, default=None)
+    parser.add_argument("--context_gate_anchor_hour", default=None, help="Optional true/false override for anchor-hour graph gate.")
+    parser.add_argument("--context_gate_anchor_hour_index", type=int, default=None)
+    parser.add_argument("--context_gate_anchor_embed_dim", type=int, default=None)
+    parser.add_argument("--context_gate_anchor_od_prior", type=float, default=None)
+    parser.add_argument("--context_gate_scope", default=None, choices=[None, "all", "od_only", "od_residual_correction", "hard_anchor_od"])
     args = parser.parse_args()
 
     data_dir = PROJECT_ROOT / args.data_dir
@@ -555,23 +563,46 @@ def main():
         recovered_graph_use = parse_graph_use(get_cli_value(training_metadata.get("entry_args"), "--graph_use"))
     if recovered_graph_use is None:
         recovered_graph_use = ["dist", "neighb", "distri", "tempp", "func", "od00", "od06", "od12", "od16", "od20"]
-    context_gate = parse_bool_value(cli_value_or_default(training_metadata, "--context_gate"), default=False)
-    context_gate_hidden_dim = int(cli_value_or_default(training_metadata, "--context_gate_hidden_dim", 32))
-    context_gate_residual = float(cli_value_or_default(training_metadata, "--context_gate_residual", 0.5))
+    context_gate = parse_bool_value(
+        args.context_gate if args.context_gate is not None else cli_value_or_default(training_metadata, "--context_gate"),
+        default=False,
+    )
+    context_gate_hidden_dim = int(
+        args.context_gate_hidden_dim
+        if args.context_gate_hidden_dim is not None
+        else cli_value_or_default(training_metadata, "--context_gate_hidden_dim", 32)
+    )
+    context_gate_residual = float(
+        args.context_gate_residual
+        if args.context_gate_residual is not None
+        else cli_value_or_default(training_metadata, "--context_gate_residual", 0.5)
+    )
     context_gate_anchor_hour = parse_bool_value(
-        cli_value_or_default(training_metadata, "--context_gate_anchor_hour"),
+        args.context_gate_anchor_hour
+        if args.context_gate_anchor_hour is not None
+        else cli_value_or_default(training_metadata, "--context_gate_anchor_hour"),
         default=False,
     )
     context_gate_anchor_hour_index = int(
-        cli_value_or_default(training_metadata, "--context_gate_anchor_hour_index", -1)
+        args.context_gate_anchor_hour_index
+        if args.context_gate_anchor_hour_index is not None
+        else cli_value_or_default(training_metadata, "--context_gate_anchor_hour_index", -1)
     )
     context_gate_anchor_embed_dim = int(
-        cli_value_or_default(training_metadata, "--context_gate_anchor_embed_dim", 8)
+        args.context_gate_anchor_embed_dim
+        if args.context_gate_anchor_embed_dim is not None
+        else cli_value_or_default(training_metadata, "--context_gate_anchor_embed_dim", 8)
     )
     context_gate_anchor_od_prior = float(
-        cli_value_or_default(training_metadata, "--context_gate_anchor_od_prior", 0.0)
+        args.context_gate_anchor_od_prior
+        if args.context_gate_anchor_od_prior is not None
+        else cli_value_or_default(training_metadata, "--context_gate_anchor_od_prior", 0.0)
     )
-    context_gate_scope = cli_value_or_default(training_metadata, "--context_gate_scope", "all")
+    context_gate_scope = (
+        args.context_gate_scope
+        if args.context_gate_scope is not None
+        else cli_value_or_default(training_metadata, "--context_gate_scope", "all")
+    )
 
     device = resolve_device(args.device)
     graph_config = {

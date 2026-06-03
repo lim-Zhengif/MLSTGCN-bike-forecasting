@@ -148,7 +148,7 @@ parser.add_argument(
     '--context_gate_residual',
     type=float,
     default=0.5,
-    help='Blend context graph weights with a uniform prior. 0 means full context gate; 0.5 is conservative.',
+    help='Blend context graph weights with a uniform prior. For od_residual_correction, this controls how strongly OD multipliers stay near 1.',
 )
 parser.add_argument(
     '--context_gate_anchor_hour',
@@ -170,9 +170,9 @@ parser.add_argument(
 )
 parser.add_argument(
     '--context_gate_scope',
-    choices=['all', 'od_only', 'hard_anchor_od'],
+    choices=['all', 'od_only', 'od_residual_correction', 'hard_anchor_od'],
     default='all',
-    help='Apply context gate to all graphs, only redistribute OD graphs, or hard-select the matching anchor-hour OD graph.',
+    help='Apply context gate to all graphs, redistribute OD graphs, softly correct OD graphs around the exp10 fusion prior, or hard-select the matching anchor-hour OD graph.',
 )
 parser.add_argument(
     '--anchor_homogeneous_batches',

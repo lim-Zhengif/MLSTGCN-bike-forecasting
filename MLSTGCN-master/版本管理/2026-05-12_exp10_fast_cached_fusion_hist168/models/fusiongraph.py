@@ -332,7 +332,7 @@ class FusionGraphModel(nn.Module):
             self.used_graphs = self.graph.get_used_graphs()
             assert len(self.used_graphs) == self.graph.graph_num
             if self.context_gate:
-                if self.context_gate_scope in {'od_only', 'hard_anchor_od'}:
+                if self.context_gate_scope in {'od_only', 'od_residual_correction', 'hard_anchor_od'}:
                     self.context_gate_graph_indices = [
                         idx for idx, name in enumerate(self.graph.use_graph)
                         if str(name).startswith('od')
@@ -514,7 +514,7 @@ class FusionGraphModel(nn.Module):
             if prior_logits is not None:
                 context_logits = context_logits + prior_logits
         context_weights = torch.softmax(context_logits, dim=0)
-        if self.context_gate_residual > 0:
+        if self.context_gate_residual > 0 and self.context_gate_scope != 'od_residual_correction':
             uniform = torch.full_like(context_weights, 1.0 / self.graph.graph_num)
             if self.context_gate_scope == 'od_only':
                 uniform = torch.full_like(context_weights, 1.0 / self.context_gate_output_dim)
@@ -522,16 +522,24 @@ class FusionGraphModel(nn.Module):
                 (1.0 - self.context_gate_residual) * context_weights
                 + self.context_gate_residual * uniform
             )
-        if self.context_gate_scope == 'od_only':
+        if self.context_gate_scope in {'od_only', 'od_residual_correction'}:
             display_weights = torch.zeros(self.graph.graph_num, device=context_weights.device)
             multipliers = torch.ones(self.graph.graph_num, device=context_weights.device)
             index_tensor = torch.tensor(self.context_gate_graph_indices, device=context_weights.device, dtype=torch.long)
             display_weights[index_tensor] = context_weights
-            multipliers[index_tensor] = context_weights * self.context_gate_output_dim
+            correction = context_weights * self.context_gate_output_dim
+            if self.context_gate_scope == 'od_residual_correction':
+                correction = (
+                    self.context_gate_residual * torch.ones_like(correction)
+                    + (1.0 - self.context_gate_residual) * correction
+                )
+            multipliers[index_tensor] = correction
             self.context_gate_for_run = display_weights
+            self.context_gate_multipliers_for_run = multipliers
             return multipliers
 
         self.context_gate_for_run = context_weights
+        self.context_gate_multipliers_for_run = context_weights
         return context_weights
 
     def forward(self, x=None, anchor_hours=None):
