@@ -245,6 +245,135 @@ class TrendAlignmentDecoder(nn.Module):
         return output.permute(0, 2, 1, 3)
 
 
+class CausalGatedTemporalBlock(nn.Module):
+    def __init__(self, hidden_dim, kernel_size=3, dilation=1, dropout=0.1):
+        super(CausalGatedTemporalBlock, self).__init__()
+        self.padding = (int(kernel_size) - 1) * int(dilation)
+        self.conv = nn.Conv1d(
+            hidden_dim,
+            hidden_dim * 2,
+            kernel_size=int(kernel_size),
+            dilation=int(dilation),
+        )
+        self.dropout = nn.Dropout(float(dropout))
+        self.norm = nn.BatchNorm1d(hidden_dim)
+
+    def forward(self, x):
+        residual = x
+        gated = self.conv(F.pad(x, (self.padding, 0)))
+        tanh_part, sigmoid_part = torch.chunk(gated, chunks=2, dim=1)
+        out = torch.tanh(tanh_part) * torch.sigmoid(sigmoid_part)
+        out = self.dropout(out)
+        return self.norm(out + residual)
+
+
+class GraphMaskedSpatialAttention(nn.Module):
+    def __init__(self, hidden_dim, heads=4, dropout=0.1):
+        super(GraphMaskedSpatialAttention, self).__init__()
+        hidden_dim = int(hidden_dim)
+        heads = max(int(heads), 1)
+        while hidden_dim % heads != 0 and heads > 1:
+            heads -= 1
+        self.hidden_dim = hidden_dim
+        self.heads = heads
+        self.head_dim = hidden_dim // heads
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.dropout = nn.Dropout(float(dropout))
+
+    def forward(self, node_state, adj_for_run):
+        batch_size, num_nodes, hidden_dim = node_state.shape
+        q = self.q_proj(node_state).view(batch_size, num_nodes, self.heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.k_proj(node_state).view(batch_size, num_nodes, self.heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.v_proj(node_state).view(batch_size, num_nodes, self.heads, self.head_dim).permute(0, 2, 1, 3)
+
+        scores = torch.matmul(q, k.transpose(-1, -2)) / (self.head_dim ** 0.5)
+        if adj_for_run is not None:
+            graph_mask = adj_for_run.detach() > 0
+            eye_mask = torch.eye(num_nodes, device=node_state.device, dtype=torch.bool)
+            if graph_mask.dim() == 2:
+                graph_mask = graph_mask | eye_mask
+                graph_mask = graph_mask.view(1, 1, num_nodes, num_nodes)
+            elif graph_mask.dim() == 3:
+                graph_mask = graph_mask | eye_mask.view(1, num_nodes, num_nodes)
+                if graph_mask.shape[0] == 1 and batch_size > 1:
+                    graph_mask = graph_mask.expand(batch_size, -1, -1)
+                if graph_mask.shape[0] != batch_size:
+                    raise ValueError("Batch graph mask size does not match node_state batch size.")
+                graph_mask = graph_mask.view(batch_size, 1, num_nodes, num_nodes)
+            else:
+                raise ValueError("adj_for_run must be a 2D or 3D adjacency tensor.")
+            scores = scores.masked_fill(~graph_mask, -1e9)
+        attn = torch.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        out = torch.matmul(attn, v).permute(0, 2, 1, 3).contiguous().view(batch_size, num_nodes, hidden_dim)
+        return self.out_proj(out)
+
+
+class ASTTCNResidualBranch(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        hidden_dim,
+        num_for_predict,
+        out_dim,
+        layers=4,
+        kernel_size=3,
+        dilation_base=2,
+        heads=4,
+        dropout=0.1,
+        residual_init=0.05,
+    ):
+        super(ASTTCNResidualBranch, self).__init__()
+        self.num_for_predict = int(num_for_predict)
+        self.out_dim = int(out_dim)
+        self.input_proj = nn.Linear(int(in_channels), int(hidden_dim))
+        self.temporal_blocks = nn.ModuleList([
+            CausalGatedTemporalBlock(
+                hidden_dim=int(hidden_dim),
+                kernel_size=int(kernel_size),
+                dilation=int(dilation_base) ** layer_idx,
+                dropout=float(dropout),
+            )
+            for layer_idx in range(int(layers))
+        ])
+        self.spatial_attention = GraphMaskedSpatialAttention(
+            hidden_dim=int(hidden_dim),
+            heads=int(heads),
+            dropout=float(dropout),
+        )
+        self.stim_gate = nn.Sequential(
+            nn.Linear(int(hidden_dim) * 2, int(hidden_dim)),
+            nn.Sigmoid(),
+        )
+        self.output_proj = nn.Sequential(
+            nn.LayerNorm(int(hidden_dim)),
+            nn.Linear(int(hidden_dim), int(hidden_dim)),
+            nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), self.num_for_predict * self.out_dim),
+        )
+        self.residual_alpha = nn.Parameter(torch.tensor(float(residual_init), dtype=torch.float32))
+
+    def forward(self, x, adj_for_run=None):
+        # x: (B, N, F, T). This branch predicts a small residual in scaled target space.
+        batch_size, num_nodes, _, hist_len = x.shape
+        hidden = self.input_proj(x.permute(0, 1, 3, 2))  # (B, N, T, H)
+        hidden = hidden.reshape(batch_size * num_nodes, hist_len, -1).transpose(1, 2)
+        for block in self.temporal_blocks:
+            hidden = block(hidden)
+        temporal_state = hidden[:, :, -1].view(batch_size, num_nodes, -1)
+
+        spatial_state = self.spatial_attention(temporal_state, adj_for_run)
+        gate = self.stim_gate(torch.cat([spatial_state, temporal_state], dim=-1))
+        fused = gate * spatial_state + (1.0 - gate) * temporal_state
+        residual = self.output_proj(fused).view(batch_size, num_nodes, self.num_for_predict, self.out_dim)
+        residual = residual.permute(0, 2, 1, 3)
+        return self.residual_alpha * residual
+
+
 class cheb_conv(nn.Module):
     '''
     K-order chebyshev graph convolution
@@ -384,6 +513,14 @@ class MSTGCN_submodule(nn.Module):
         trend_time_embed_dim=16,
         trend_attention_heads=4,
         trend_dropout=0.1,
+        ast_tcn_residual=False,
+        ast_tcn_hidden_dim=32,
+        ast_tcn_layers=4,
+        ast_tcn_kernel_size=3,
+        ast_tcn_dilation_base=2,
+        ast_tcn_heads=4,
+        ast_tcn_dropout=0.1,
+        ast_tcn_residual_init=0.05,
     ):
 
 
@@ -478,6 +615,21 @@ class MSTGCN_submodule(nn.Module):
                 kernel_size=(1, nb_time_filter),
             )
 
+        self.use_ast_tcn_residual = bool(ast_tcn_residual)
+        if self.use_ast_tcn_residual:
+            self.ast_tcn_branch = ASTTCNResidualBranch(
+                in_channels=effective_in_channels,
+                hidden_dim=ast_tcn_hidden_dim,
+                num_for_predict=num_for_predict,
+                out_dim=out_dim,
+                layers=ast_tcn_layers,
+                kernel_size=ast_tcn_kernel_size,
+                dilation_base=ast_tcn_dilation_base,
+                heads=ast_tcn_heads,
+                dropout=ast_tcn_dropout,
+                residual_init=ast_tcn_residual_init,
+            )
+
         self.DEVICE = DEVICE
         self.num_for_predict = num_for_predict
         self.out_dim = out_dim
@@ -493,6 +645,7 @@ class MSTGCN_submodule(nn.Module):
         x = self.input_adapter(x)
         x = x.permute((0, 2, 3, 1))
         x = self.input_channel_attention(x)
+        branch_x = x
 
         adj_for_run = self.fusiongraph(context_x, anchor_hours=anchor_hours)
         cheb_polynomials = self.BlockList[0].cheb_conv.build_cheb_polynomials(adj_for_run)
@@ -501,11 +654,14 @@ class MSTGCN_submodule(nn.Module):
             x = block(x, cheb_polynomials=cheb_polynomials)
 
         if self.use_trend_alignment_decoder:
-            return self.trend_decoder(x, context_x)
+            output = self.trend_decoder(x, context_x)
+        else:
+            output = self.final_conv(x.permute(0, 3, 1, 2))[:, :, :, -1]
+            batch_size, _, num_nodes = output.shape
+            output = output.view(batch_size, self.num_for_predict, self.out_dim, num_nodes)
+            output = output.permute(0, 1, 3, 2)
 
-        output = self.final_conv(x.permute(0, 3, 1, 2))[:, :, :, -1]
-        batch_size, _, num_nodes = output.shape
-        output = output.view(batch_size, self.num_for_predict, self.out_dim, num_nodes)
-        output = output.permute(0, 1, 3, 2)
+        if self.use_ast_tcn_residual:
+            output = output + self.ast_tcn_branch(branch_x, adj_for_run=adj_for_run)
 
         return output

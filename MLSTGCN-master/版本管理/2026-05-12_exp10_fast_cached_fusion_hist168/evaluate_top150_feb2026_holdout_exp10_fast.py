@@ -65,6 +65,22 @@ class EvalWrapper(nn.Module):
                 time_kernel_size=model_config["time_kernel_size"],
                 channel_attention=model_config.get("channel_attention", False),
                 channel_attention_reduction=model_config.get("channel_attention_reduction", 4),
+                trend_alignment_decoder=model_config.get("trend_alignment_decoder", False),
+                trend_time_feature_index=model_config.get("trend_time_feature_index", -1),
+                trend_time_feature_mean=model_config.get("trend_time_feature_mean", 0.0),
+                trend_time_feature_std=model_config.get("trend_time_feature_std", 1.0),
+                trend_time_cycle=model_config.get("trend_time_cycle", 24),
+                trend_time_embed_dim=model_config.get("trend_time_embed_dim", 16),
+                trend_attention_heads=model_config.get("trend_attention_heads", 4),
+                trend_dropout=model_config.get("trend_dropout", 0.1),
+                ast_tcn_residual=model_config.get("ast_tcn_residual", False),
+                ast_tcn_hidden_dim=model_config.get("ast_tcn_hidden_dim", 32),
+                ast_tcn_layers=model_config.get("ast_tcn_layers", 4),
+                ast_tcn_kernel_size=model_config.get("ast_tcn_kernel_size", 3),
+                ast_tcn_dilation_base=model_config.get("ast_tcn_dilation_base", 2),
+                ast_tcn_heads=model_config.get("ast_tcn_heads", 4),
+                ast_tcn_dropout=model_config.get("ast_tcn_dropout", 0.1),
+                ast_tcn_residual_init=model_config.get("ast_tcn_residual_init", 0.05),
             )
         elif model_config.get("use") == "D2STGNN":
             self.model = D2STGNNFusionBackbone(
@@ -160,6 +176,28 @@ def resolve_anchor_hour_gate_stats(metadata, requested_index):
         "context_gate_anchor_hour_index": hour_index,
         "context_gate_anchor_hour_mean": float(feature_mean[hour_index]),
         "context_gate_anchor_hour_std": float(feature_std[hour_index] if feature_std[hour_index] != 0 else 1.0),
+    }
+
+
+def resolve_trend_time_stats(metadata, requested_index, time_cycle):
+    feature_mean = metadata["feature_mean"].reshape(-1)
+    feature_std = metadata["feature_std"].reshape(-1)
+    time_index = int(requested_index)
+    if time_index < 0:
+        preferred_tokens = ["\u5c0f\u65f6", "hour"] if int(time_cycle) != 48 else ["slot", "\u534a\u5c0f\u65f6"]
+        for token in preferred_tokens:
+            for idx, name in enumerate(metadata["input_feature_cols"]):
+                if token in name and not name.startswith("future_"):
+                    time_index = idx
+                    break
+            if time_index >= 0:
+                break
+    if time_index < 0 or time_index >= len(feature_mean):
+        raise ValueError("--trend_alignment_decoder requires an intra-day time feature index.")
+    return {
+        "trend_time_feature_index": time_index,
+        "trend_time_feature_mean": float(feature_mean[time_index]),
+        "trend_time_feature_std": float(feature_std[time_index] if feature_std[time_index] != 0 else 1.0),
     }
 
 
@@ -438,6 +476,14 @@ def main():
     parser.add_argument("--context_gate_anchor_embed_dim", type=int, default=None)
     parser.add_argument("--context_gate_anchor_od_prior", type=float, default=None)
     parser.add_argument("--context_gate_scope", default=None, choices=[None, "all", "od_only", "od_residual_correction", "hard_anchor_od"])
+    parser.add_argument("--ast_tcn_residual", default=None, help="Optional true/false override for AST-TCN residual branch.")
+    parser.add_argument("--ast_tcn_hidden_dim", type=int, default=None)
+    parser.add_argument("--ast_tcn_layers", type=int, default=None)
+    parser.add_argument("--ast_tcn_kernel_size", type=int, default=None)
+    parser.add_argument("--ast_tcn_dilation_base", type=int, default=None)
+    parser.add_argument("--ast_tcn_heads", type=int, default=None)
+    parser.add_argument("--ast_tcn_dropout", type=float, default=None)
+    parser.add_argument("--ast_tcn_residual_init", type=float, default=None)
     args = parser.parse_args()
 
     data_dir = PROJECT_ROOT / args.data_dir
@@ -643,6 +689,56 @@ def main():
         "time_kernel_size": 3,
         "channel_attention": False,
         "channel_attention_reduction": 4,
+        "trend_alignment_decoder": parse_bool_value(
+            cli_value_or_default(training_metadata, "--trend_alignment_decoder"),
+            default=False,
+        ),
+        "trend_time_feature_index": int(cli_value_or_default(training_metadata, "--trend_time_feature_index", -1)),
+        "trend_time_cycle": int(cli_value_or_default(training_metadata, "--trend_time_cycle", 24)),
+        "trend_time_embed_dim": int(cli_value_or_default(training_metadata, "--trend_time_embed_dim", 16)),
+        "trend_attention_heads": int(cli_value_or_default(training_metadata, "--trend_attention_heads", 4)),
+        "trend_dropout": float(cli_value_or_default(training_metadata, "--trend_dropout", 0.1)),
+        "ast_tcn_residual": parse_bool_value(
+            args.ast_tcn_residual
+            if args.ast_tcn_residual is not None
+            else cli_value_or_default(training_metadata, "--ast_tcn_residual"),
+            default=False,
+        ),
+        "ast_tcn_hidden_dim": int(
+            args.ast_tcn_hidden_dim
+            if args.ast_tcn_hidden_dim is not None
+            else cli_value_or_default(training_metadata, "--ast_tcn_hidden_dim", 32)
+        ),
+        "ast_tcn_layers": int(
+            args.ast_tcn_layers
+            if args.ast_tcn_layers is not None
+            else cli_value_or_default(training_metadata, "--ast_tcn_layers", 4)
+        ),
+        "ast_tcn_kernel_size": int(
+            args.ast_tcn_kernel_size
+            if args.ast_tcn_kernel_size is not None
+            else cli_value_or_default(training_metadata, "--ast_tcn_kernel_size", 3)
+        ),
+        "ast_tcn_dilation_base": int(
+            args.ast_tcn_dilation_base
+            if args.ast_tcn_dilation_base is not None
+            else cli_value_or_default(training_metadata, "--ast_tcn_dilation_base", 2)
+        ),
+        "ast_tcn_heads": int(
+            args.ast_tcn_heads
+            if args.ast_tcn_heads is not None
+            else cli_value_or_default(training_metadata, "--ast_tcn_heads", 4)
+        ),
+        "ast_tcn_dropout": float(
+            args.ast_tcn_dropout
+            if args.ast_tcn_dropout is not None
+            else cli_value_or_default(training_metadata, "--ast_tcn_dropout", 0.1)
+        ),
+        "ast_tcn_residual_init": float(
+            args.ast_tcn_residual_init
+            if args.ast_tcn_residual_init is not None
+            else cli_value_or_default(training_metadata, "--ast_tcn_residual_init", 0.05)
+        ),
         "d2_hidden_dim": int(cli_value_or_default(training_metadata, "--d2_hidden_dim", 64)),
         "d2_num_layers": int(cli_value_or_default(training_metadata, "--d2_num_layers", 4)),
         "d2_dropout": float(cli_value_or_default(training_metadata, "--d2_dropout", 0.1)),
@@ -660,6 +756,14 @@ def main():
         ),
         "d2_fusion_init": float(cli_value_or_default(training_metadata, "--d2_fusion_init", 1.0)),
     }
+    if model_config["trend_alignment_decoder"]:
+        model_config.update(
+            resolve_trend_time_stats(
+                metadata,
+                requested_index=model_config["trend_time_feature_index"],
+                time_cycle=model_config["trend_time_cycle"],
+            )
+        )
 
     fusiongraph_module.PROJECT_ROOT = str(PROJECT_ROOT)
     graph = BikeGraph(str(graph_dir), graph_config, device)
@@ -795,6 +899,15 @@ def main():
         "context_gate_anchor_embed_dim": graph_config["context_gate_anchor_embed_dim"],
         "context_gate_anchor_od_prior": graph_config["context_gate_anchor_od_prior"],
         "context_gate_scope": graph_config["context_gate_scope"],
+        "trend_alignment_decoder": model_config["trend_alignment_decoder"],
+        "ast_tcn_residual": model_config["ast_tcn_residual"],
+        "ast_tcn_hidden_dim": model_config["ast_tcn_hidden_dim"],
+        "ast_tcn_layers": model_config["ast_tcn_layers"],
+        "ast_tcn_kernel_size": model_config["ast_tcn_kernel_size"],
+        "ast_tcn_dilation_base": model_config["ast_tcn_dilation_base"],
+        "ast_tcn_heads": model_config["ast_tcn_heads"],
+        "ast_tcn_dropout": model_config["ast_tcn_dropout"],
+        "ast_tcn_residual_init": model_config["ast_tcn_residual_init"],
         "trip_files": trip_files,
         "date_start": str(eval_dates[0]),
         "date_end": str(eval_dates[-1]),
