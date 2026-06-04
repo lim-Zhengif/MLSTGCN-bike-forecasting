@@ -216,6 +216,9 @@ parser.add_argument('--ast_tcn_dilation_base', type=int, default=2)
 parser.add_argument('--ast_tcn_heads', type=int, default=4)
 parser.add_argument('--ast_tcn_dropout', type=float, default=0.1)
 parser.add_argument('--ast_tcn_residual_init', type=float, default=0.05)
+parser.add_argument('--ast_tcn_bounded_alpha', default='false', help="Use 'true' or 'false' to bound the AST-TCN residual scale.")
+parser.add_argument('--ast_tcn_alpha_max', type=float, default=0.1)
+parser.add_argument('--ast_tcn_zero_init', default='false', help="Use 'true' or 'false' to zero-init the AST-TCN residual output head.")
 parser.add_argument('--d2_hidden_dim', type=int, default=64)
 parser.add_argument('--d2_num_layers', type=int, default=4)
 parser.add_argument('--d2_dropout', type=float, default=0.1)
@@ -299,6 +302,8 @@ args.context_gate_anchor_hour = parse_bool_arg(args.context_gate_anchor_hour, '-
 args.anchor_homogeneous_batches = parse_bool_arg(args.anchor_homogeneous_batches, '--anchor_homogeneous_batches')
 args.trend_alignment_decoder = parse_bool_arg(args.trend_alignment_decoder, '--trend_alignment_decoder')
 args.ast_tcn_residual = parse_bool_arg(args.ast_tcn_residual, '--ast_tcn_residual')
+args.ast_tcn_bounded_alpha = parse_bool_arg(args.ast_tcn_bounded_alpha, '--ast_tcn_bounded_alpha')
+args.ast_tcn_zero_init = parse_bool_arg(args.ast_tcn_zero_init, '--ast_tcn_zero_init')
 args.channel_attention = parse_bool_arg(args.channel_attention, '--channel_attention')
 args.d2_adaptive_adj = parse_bool_arg(args.d2_adaptive_adj, '--d2_adaptive_adj')
 args.d2_use_reverse = parse_bool_arg(args.d2_use_reverse, '--d2_use_reverse')
@@ -352,6 +357,10 @@ if args.ast_tcn_heads <= 0:
     parser.error('--ast_tcn_heads must be > 0.')
 if args.ast_tcn_dropout < 0:
     parser.error('--ast_tcn_dropout must be >= 0.')
+if args.ast_tcn_alpha_max <= 0:
+    parser.error('--ast_tcn_alpha_max must be > 0.')
+if args.ast_tcn_bounded_alpha and not (0.0 <= args.ast_tcn_residual_init <= args.ast_tcn_alpha_max):
+    parser.error('--ast_tcn_residual_init must be within [0, --ast_tcn_alpha_max] when --ast_tcn_bounded_alpha true.')
 if args.fusion_heads <= 0:
     parser.error('--fusion_heads must be > 0.')
 if args.fusion_head_dim <= 0:
@@ -464,6 +473,9 @@ hyperparameter_defaults = dict(
         ast_tcn_heads=args.ast_tcn_heads,
         ast_tcn_dropout=args.ast_tcn_dropout,
         ast_tcn_residual_init=args.ast_tcn_residual_init,
+        ast_tcn_bounded_alpha=args.ast_tcn_bounded_alpha,
+        ast_tcn_alpha_max=args.ast_tcn_alpha_max,
+        ast_tcn_zero_init=args.ast_tcn_zero_init,
         d2_hidden_dim=args.d2_hidden_dim,
         d2_num_layers=args.d2_num_layers,
         d2_dropout=args.d2_dropout,
@@ -998,6 +1010,9 @@ class LightningModel(LightningModule):
                 ast_tcn_heads=config['model']['ast_tcn_heads'],
                 ast_tcn_dropout=config['model']['ast_tcn_dropout'],
                 ast_tcn_residual_init=config['model']['ast_tcn_residual_init'],
+                ast_tcn_bounded_alpha=config['model']['ast_tcn_bounded_alpha'],
+                ast_tcn_alpha_max=config['model']['ast_tcn_alpha_max'],
+                ast_tcn_zero_init=config['model']['ast_tcn_zero_init'],
             )
         elif config['model']['use'] == 'D2STGNN':
             self.model = D2STGNNFusionBackbone(
@@ -1023,6 +1038,9 @@ class LightningModel(LightningModule):
             raise NotImplementedError('Unsupported model_use: %s' % config['model']['use'])
         for param_name, param in self.model.named_parameters():
             if param_name.endswith('fusion_alpha') or param_name.endswith('residual_alpha'):
+                continue
+            if config['model'].get('ast_tcn_zero_init', False) and param_name.startswith('ast_tcn_branch.output_proj.4.'):
+                nn.init.zeros_(param)
                 continue
             if config['model']['use'] == 'D2STGNN' and param_name.endswith('norm.weight'):
                 nn.init.ones_(param)

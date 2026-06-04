@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 import os
 import numpy as np
 import torch
@@ -325,10 +326,15 @@ class ASTTCNResidualBranch(nn.Module):
         heads=4,
         dropout=0.1,
         residual_init=0.05,
+        bounded_alpha=False,
+        alpha_max=0.1,
+        zero_init=False,
     ):
         super(ASTTCNResidualBranch, self).__init__()
         self.num_for_predict = int(num_for_predict)
         self.out_dim = int(out_dim)
+        self.bounded_alpha = bool(bounded_alpha)
+        self.alpha_max = float(alpha_max)
         self.input_proj = nn.Linear(int(in_channels), int(hidden_dim))
         self.temporal_blocks = nn.ModuleList([
             CausalGatedTemporalBlock(
@@ -355,7 +361,23 @@ class ASTTCNResidualBranch(nn.Module):
             nn.Dropout(float(dropout)),
             nn.Linear(int(hidden_dim), self.num_for_predict * self.out_dim),
         )
-        self.residual_alpha = nn.Parameter(torch.tensor(float(residual_init), dtype=torch.float32))
+        if bool(zero_init):
+            nn.init.zeros_(self.output_proj[-1].weight)
+            nn.init.zeros_(self.output_proj[-1].bias)
+        if self.bounded_alpha:
+            if self.alpha_max <= 0:
+                raise ValueError("alpha_max must be > 0 when bounded_alpha is enabled.")
+            init_ratio = float(residual_init) / self.alpha_max
+            init_ratio = min(max(init_ratio, 1e-4), 1.0 - 1e-4)
+            raw_init = math.log(init_ratio / (1.0 - init_ratio))
+            self.residual_alpha = nn.Parameter(torch.tensor(raw_init, dtype=torch.float32))
+        else:
+            self.residual_alpha = nn.Parameter(torch.tensor(float(residual_init), dtype=torch.float32))
+
+    def residual_scale(self):
+        if self.bounded_alpha:
+            return self.alpha_max * torch.sigmoid(self.residual_alpha)
+        return self.residual_alpha
 
     def forward(self, x, adj_for_run=None):
         # x: (B, N, F, T). This branch predicts a small residual in scaled target space.
@@ -371,7 +393,7 @@ class ASTTCNResidualBranch(nn.Module):
         fused = gate * spatial_state + (1.0 - gate) * temporal_state
         residual = self.output_proj(fused).view(batch_size, num_nodes, self.num_for_predict, self.out_dim)
         residual = residual.permute(0, 2, 1, 3)
-        return self.residual_alpha * residual
+        return self.residual_scale() * residual
 
 
 class cheb_conv(nn.Module):
@@ -521,6 +543,9 @@ class MSTGCN_submodule(nn.Module):
         ast_tcn_heads=4,
         ast_tcn_dropout=0.1,
         ast_tcn_residual_init=0.05,
+        ast_tcn_bounded_alpha=False,
+        ast_tcn_alpha_max=0.1,
+        ast_tcn_zero_init=False,
     ):
 
 
@@ -628,6 +653,9 @@ class MSTGCN_submodule(nn.Module):
                 heads=ast_tcn_heads,
                 dropout=ast_tcn_dropout,
                 residual_init=ast_tcn_residual_init,
+                bounded_alpha=ast_tcn_bounded_alpha,
+                alpha_max=ast_tcn_alpha_max,
+                zero_init=ast_tcn_zero_init,
             )
 
         self.DEVICE = DEVICE
