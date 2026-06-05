@@ -25,6 +25,7 @@ PROJECT_ROOT = detect_project_root(PROJ_DIR)
 
 import argparse
 import json
+import math
 import subprocess
 
 from torch import nn
@@ -219,6 +220,9 @@ parser.add_argument('--ast_tcn_residual_init', type=float, default=0.05)
 parser.add_argument('--ast_tcn_bounded_alpha', default='false', help="Use 'true' or 'false' to bound the AST-TCN residual scale.")
 parser.add_argument('--ast_tcn_alpha_max', type=float, default=0.1)
 parser.add_argument('--ast_tcn_zero_init', default='false', help="Use 'true' or 'false' to zero-init the AST-TCN residual output head.")
+parser.add_argument('--ast_tcn_residual_gate', default='false', help="Use 'true' or 'false' to learn a dynamic gate for the AST-TCN residual branch.")
+parser.add_argument('--ast_tcn_residual_gate_hidden_dim', type=int, default=16)
+parser.add_argument('--ast_tcn_residual_gate_init', type=float, default=0.2)
 parser.add_argument('--d2_hidden_dim', type=int, default=64)
 parser.add_argument('--d2_num_layers', type=int, default=4)
 parser.add_argument('--d2_dropout', type=float, default=0.1)
@@ -304,6 +308,7 @@ args.trend_alignment_decoder = parse_bool_arg(args.trend_alignment_decoder, '--t
 args.ast_tcn_residual = parse_bool_arg(args.ast_tcn_residual, '--ast_tcn_residual')
 args.ast_tcn_bounded_alpha = parse_bool_arg(args.ast_tcn_bounded_alpha, '--ast_tcn_bounded_alpha')
 args.ast_tcn_zero_init = parse_bool_arg(args.ast_tcn_zero_init, '--ast_tcn_zero_init')
+args.ast_tcn_residual_gate = parse_bool_arg(args.ast_tcn_residual_gate, '--ast_tcn_residual_gate')
 args.channel_attention = parse_bool_arg(args.channel_attention, '--channel_attention')
 args.d2_adaptive_adj = parse_bool_arg(args.d2_adaptive_adj, '--d2_adaptive_adj')
 args.d2_use_reverse = parse_bool_arg(args.d2_use_reverse, '--d2_use_reverse')
@@ -361,6 +366,10 @@ if args.ast_tcn_alpha_max <= 0:
     parser.error('--ast_tcn_alpha_max must be > 0.')
 if args.ast_tcn_bounded_alpha and not (0.0 <= args.ast_tcn_residual_init <= args.ast_tcn_alpha_max):
     parser.error('--ast_tcn_residual_init must be within [0, --ast_tcn_alpha_max] when --ast_tcn_bounded_alpha true.')
+if args.ast_tcn_residual_gate_hidden_dim <= 0:
+    parser.error('--ast_tcn_residual_gate_hidden_dim must be > 0.')
+if not (0.0 < args.ast_tcn_residual_gate_init < 1.0):
+    parser.error('--ast_tcn_residual_gate_init must be within (0, 1).')
 if args.fusion_heads <= 0:
     parser.error('--fusion_heads must be > 0.')
 if args.fusion_head_dim <= 0:
@@ -476,6 +485,9 @@ hyperparameter_defaults = dict(
         ast_tcn_bounded_alpha=args.ast_tcn_bounded_alpha,
         ast_tcn_alpha_max=args.ast_tcn_alpha_max,
         ast_tcn_zero_init=args.ast_tcn_zero_init,
+        ast_tcn_residual_gate=args.ast_tcn_residual_gate,
+        ast_tcn_residual_gate_hidden_dim=args.ast_tcn_residual_gate_hidden_dim,
+        ast_tcn_residual_gate_init=args.ast_tcn_residual_gate_init,
         d2_hidden_dim=args.d2_hidden_dim,
         d2_num_layers=args.d2_num_layers,
         d2_dropout=args.d2_dropout,
@@ -1013,6 +1025,9 @@ class LightningModel(LightningModule):
                 ast_tcn_bounded_alpha=config['model']['ast_tcn_bounded_alpha'],
                 ast_tcn_alpha_max=config['model']['ast_tcn_alpha_max'],
                 ast_tcn_zero_init=config['model']['ast_tcn_zero_init'],
+                ast_tcn_residual_gate=config['model']['ast_tcn_residual_gate'],
+                ast_tcn_residual_gate_hidden_dim=config['model']['ast_tcn_residual_gate_hidden_dim'],
+                ast_tcn_residual_gate_init=config['model']['ast_tcn_residual_gate_init'],
             )
         elif config['model']['use'] == 'D2STGNN':
             self.model = D2STGNNFusionBackbone(
@@ -1041,6 +1056,13 @@ class LightningModel(LightningModule):
                 continue
             if config['model'].get('ast_tcn_zero_init', False) and param_name.startswith('ast_tcn_branch.output_proj.4.'):
                 nn.init.zeros_(param)
+                continue
+            if config['model'].get('ast_tcn_residual_gate', False) and param_name.startswith('ast_tcn_branch.residual_gate.4.'):
+                if param_name.endswith('.weight'):
+                    nn.init.zeros_(param)
+                else:
+                    gate_init = float(config['model'].get('ast_tcn_residual_gate_init', 0.2))
+                    nn.init.constant_(param, math.log(gate_init / (1.0 - gate_init)))
                 continue
             if config['model']['use'] == 'D2STGNN' and param_name.endswith('norm.weight'):
                 nn.init.ones_(param)

@@ -329,12 +329,16 @@ class ASTTCNResidualBranch(nn.Module):
         bounded_alpha=False,
         alpha_max=0.1,
         zero_init=False,
+        residual_gate=False,
+        residual_gate_hidden_dim=16,
+        residual_gate_init=0.2,
     ):
         super(ASTTCNResidualBranch, self).__init__()
         self.num_for_predict = int(num_for_predict)
         self.out_dim = int(out_dim)
         self.bounded_alpha = bool(bounded_alpha)
         self.alpha_max = float(alpha_max)
+        self.use_residual_gate = bool(residual_gate)
         self.input_proj = nn.Linear(int(in_channels), int(hidden_dim))
         self.temporal_blocks = nn.ModuleList([
             CausalGatedTemporalBlock(
@@ -361,6 +365,21 @@ class ASTTCNResidualBranch(nn.Module):
             nn.Dropout(float(dropout)),
             nn.Linear(int(hidden_dim), self.num_for_predict * self.out_dim),
         )
+        if self.use_residual_gate:
+            gate_hidden_dim = int(residual_gate_hidden_dim)
+            if gate_hidden_dim <= 0:
+                gate_hidden_dim = max(int(hidden_dim) // 2, 1)
+            self.residual_gate = nn.Sequential(
+                nn.LayerNorm(int(hidden_dim) * 2),
+                nn.Linear(int(hidden_dim) * 2, gate_hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(float(dropout)),
+                nn.Linear(gate_hidden_dim, 1),
+                nn.Sigmoid(),
+            )
+            gate_init = min(max(float(residual_gate_init), 1e-4), 1.0 - 1e-4)
+            nn.init.zeros_(self.residual_gate[-2].weight)
+            nn.init.constant_(self.residual_gate[-2].bias, math.log(gate_init / (1.0 - gate_init)))
         if bool(zero_init):
             nn.init.zeros_(self.output_proj[-1].weight)
             nn.init.zeros_(self.output_proj[-1].bias)
@@ -393,6 +412,9 @@ class ASTTCNResidualBranch(nn.Module):
         fused = gate * spatial_state + (1.0 - gate) * temporal_state
         residual = self.output_proj(fused).view(batch_size, num_nodes, self.num_for_predict, self.out_dim)
         residual = residual.permute(0, 2, 1, 3)
+        if self.use_residual_gate:
+            residual_gate = self.residual_gate(torch.cat([spatial_state, temporal_state], dim=-1))
+            residual = residual * residual_gate.permute(0, 2, 1).unsqueeze(-1)
         return self.residual_scale() * residual
 
 
@@ -546,6 +568,9 @@ class MSTGCN_submodule(nn.Module):
         ast_tcn_bounded_alpha=False,
         ast_tcn_alpha_max=0.1,
         ast_tcn_zero_init=False,
+        ast_tcn_residual_gate=False,
+        ast_tcn_residual_gate_hidden_dim=16,
+        ast_tcn_residual_gate_init=0.2,
     ):
 
 
@@ -656,6 +681,9 @@ class MSTGCN_submodule(nn.Module):
                 bounded_alpha=ast_tcn_bounded_alpha,
                 alpha_max=ast_tcn_alpha_max,
                 zero_init=ast_tcn_zero_init,
+                residual_gate=ast_tcn_residual_gate,
+                residual_gate_hidden_dim=ast_tcn_residual_gate_hidden_dim,
+                residual_gate_init=ast_tcn_residual_gate_init,
             )
 
         self.DEVICE = DEVICE
