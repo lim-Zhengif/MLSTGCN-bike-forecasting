@@ -223,6 +223,9 @@ parser.add_argument('--ast_tcn_zero_init', default='false', help="Use 'true' or 
 parser.add_argument('--ast_tcn_residual_gate', default='false', help="Use 'true' or 'false' to learn a dynamic gate for the AST-TCN residual branch.")
 parser.add_argument('--ast_tcn_residual_gate_hidden_dim', type=int, default=16)
 parser.add_argument('--ast_tcn_residual_gate_init', type=float, default=0.2)
+parser.add_argument('--ast_tcn_edge_bias', default='false', help="Use 'true' or 'false' to add fused-graph edge weights as spatial-attention score bias.")
+parser.add_argument('--ast_tcn_edge_bias_init', type=float, default=0.1)
+parser.add_argument('--ast_tcn_edge_bias_eps', type=float, default=1e-6)
 parser.add_argument('--d2_hidden_dim', type=int, default=64)
 parser.add_argument('--d2_num_layers', type=int, default=4)
 parser.add_argument('--d2_dropout', type=float, default=0.1)
@@ -309,6 +312,7 @@ args.ast_tcn_residual = parse_bool_arg(args.ast_tcn_residual, '--ast_tcn_residua
 args.ast_tcn_bounded_alpha = parse_bool_arg(args.ast_tcn_bounded_alpha, '--ast_tcn_bounded_alpha')
 args.ast_tcn_zero_init = parse_bool_arg(args.ast_tcn_zero_init, '--ast_tcn_zero_init')
 args.ast_tcn_residual_gate = parse_bool_arg(args.ast_tcn_residual_gate, '--ast_tcn_residual_gate')
+args.ast_tcn_edge_bias = parse_bool_arg(args.ast_tcn_edge_bias, '--ast_tcn_edge_bias')
 args.channel_attention = parse_bool_arg(args.channel_attention, '--channel_attention')
 args.d2_adaptive_adj = parse_bool_arg(args.d2_adaptive_adj, '--d2_adaptive_adj')
 args.d2_use_reverse = parse_bool_arg(args.d2_use_reverse, '--d2_use_reverse')
@@ -370,6 +374,10 @@ if args.ast_tcn_residual_gate_hidden_dim <= 0:
     parser.error('--ast_tcn_residual_gate_hidden_dim must be > 0.')
 if not (0.0 < args.ast_tcn_residual_gate_init < 1.0):
     parser.error('--ast_tcn_residual_gate_init must be within (0, 1).')
+if args.ast_tcn_edge_bias_init < 0:
+    parser.error('--ast_tcn_edge_bias_init must be >= 0.')
+if args.ast_tcn_edge_bias_eps <= 0:
+    parser.error('--ast_tcn_edge_bias_eps must be > 0.')
 if args.fusion_heads <= 0:
     parser.error('--fusion_heads must be > 0.')
 if args.fusion_head_dim <= 0:
@@ -488,6 +496,9 @@ hyperparameter_defaults = dict(
         ast_tcn_residual_gate=args.ast_tcn_residual_gate,
         ast_tcn_residual_gate_hidden_dim=args.ast_tcn_residual_gate_hidden_dim,
         ast_tcn_residual_gate_init=args.ast_tcn_residual_gate_init,
+        ast_tcn_edge_bias=args.ast_tcn_edge_bias,
+        ast_tcn_edge_bias_init=args.ast_tcn_edge_bias_init,
+        ast_tcn_edge_bias_eps=args.ast_tcn_edge_bias_eps,
         d2_hidden_dim=args.d2_hidden_dim,
         d2_num_layers=args.d2_num_layers,
         d2_dropout=args.d2_dropout,
@@ -1028,6 +1039,9 @@ class LightningModel(LightningModule):
                 ast_tcn_residual_gate=config['model']['ast_tcn_residual_gate'],
                 ast_tcn_residual_gate_hidden_dim=config['model']['ast_tcn_residual_gate_hidden_dim'],
                 ast_tcn_residual_gate_init=config['model']['ast_tcn_residual_gate_init'],
+                ast_tcn_edge_bias=config['model']['ast_tcn_edge_bias'],
+                ast_tcn_edge_bias_init=config['model']['ast_tcn_edge_bias_init'],
+                ast_tcn_edge_bias_eps=config['model']['ast_tcn_edge_bias_eps'],
             )
         elif config['model']['use'] == 'D2STGNN':
             self.model = D2STGNNFusionBackbone(
@@ -1052,7 +1066,11 @@ class LightningModel(LightningModule):
         else:
             raise NotImplementedError('Unsupported model_use: %s' % config['model']['use'])
         for param_name, param in self.model.named_parameters():
-            if param_name.endswith('fusion_alpha') or param_name.endswith('residual_alpha'):
+            if (
+                param_name.endswith('fusion_alpha')
+                or param_name.endswith('residual_alpha')
+                or param_name.endswith('edge_bias_scale')
+            ):
                 continue
             if config['model'].get('ast_tcn_zero_init', False) and param_name.startswith('ast_tcn_branch.output_proj.4.'):
                 nn.init.zeros_(param)

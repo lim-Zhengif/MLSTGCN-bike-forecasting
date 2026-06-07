@@ -269,7 +269,15 @@ class CausalGatedTemporalBlock(nn.Module):
 
 
 class GraphMaskedSpatialAttention(nn.Module):
-    def __init__(self, hidden_dim, heads=4, dropout=0.1):
+    def __init__(
+        self,
+        hidden_dim,
+        heads=4,
+        dropout=0.1,
+        edge_bias=False,
+        edge_bias_init=0.1,
+        edge_bias_eps=1e-6,
+    ):
         super(GraphMaskedSpatialAttention, self).__init__()
         hidden_dim = int(hidden_dim)
         heads = max(int(heads), 1)
@@ -283,6 +291,46 @@ class GraphMaskedSpatialAttention(nn.Module):
         self.v_proj = nn.Linear(hidden_dim, hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
         self.dropout = nn.Dropout(float(dropout))
+        self.edge_bias = bool(edge_bias)
+        self.edge_bias_eps = float(edge_bias_eps)
+        if self.edge_bias:
+            if self.edge_bias_eps <= 0:
+                raise ValueError("edge_bias_eps must be > 0 when edge_bias is enabled.")
+            self.edge_bias_scale = nn.Parameter(torch.tensor(float(edge_bias_init), dtype=torch.float32))
+
+    def _prepare_graph_mask(self, adj_for_run, batch_size, num_nodes, device):
+        graph_mask = adj_for_run.detach() > 0
+        eye_mask = torch.eye(num_nodes, device=device, dtype=torch.bool)
+        if graph_mask.dim() == 2:
+            graph_mask = graph_mask | eye_mask
+            return graph_mask.view(1, 1, num_nodes, num_nodes)
+        if graph_mask.dim() == 3:
+            graph_mask = graph_mask | eye_mask.view(1, num_nodes, num_nodes)
+            if graph_mask.shape[0] == 1 and batch_size > 1:
+                graph_mask = graph_mask.expand(batch_size, -1, -1)
+            if graph_mask.shape[0] != batch_size:
+                raise ValueError("Batch graph mask size does not match node_state batch size.")
+            return graph_mask.view(batch_size, 1, num_nodes, num_nodes)
+        raise ValueError("adj_for_run must be a 2D or 3D adjacency tensor.")
+
+    def _prepare_edge_bias(self, adj_for_run, batch_size, num_nodes, device, dtype):
+        adj_weight = adj_for_run.detach().to(device=device, dtype=dtype)
+        eye_weight = torch.eye(num_nodes, device=device, dtype=dtype)
+        if adj_weight.dim() == 2:
+            adj_weight = torch.maximum(adj_weight, eye_weight)
+            row_sum = adj_weight.sum(dim=-1, keepdim=True).clamp_min(self.edge_bias_eps)
+            adj_norm = (adj_weight / row_sum).clamp_min(self.edge_bias_eps)
+            return torch.log(adj_norm).view(1, 1, num_nodes, num_nodes)
+        if adj_weight.dim() == 3:
+            adj_weight = torch.maximum(adj_weight, eye_weight.view(1, num_nodes, num_nodes))
+            if adj_weight.shape[0] == 1 and batch_size > 1:
+                adj_weight = adj_weight.expand(batch_size, -1, -1)
+            if adj_weight.shape[0] != batch_size:
+                raise ValueError("Batch edge-bias graph size does not match node_state batch size.")
+            row_sum = adj_weight.sum(dim=-1, keepdim=True).clamp_min(self.edge_bias_eps)
+            adj_norm = (adj_weight / row_sum).clamp_min(self.edge_bias_eps)
+            return torch.log(adj_norm).view(batch_size, 1, num_nodes, num_nodes)
+        raise ValueError("adj_for_run must be a 2D or 3D adjacency tensor.")
 
     def forward(self, node_state, adj_for_run):
         batch_size, num_nodes, hidden_dim = node_state.shape
@@ -292,20 +340,16 @@ class GraphMaskedSpatialAttention(nn.Module):
 
         scores = torch.matmul(q, k.transpose(-1, -2)) / (self.head_dim ** 0.5)
         if adj_for_run is not None:
-            graph_mask = adj_for_run.detach() > 0
-            eye_mask = torch.eye(num_nodes, device=node_state.device, dtype=torch.bool)
-            if graph_mask.dim() == 2:
-                graph_mask = graph_mask | eye_mask
-                graph_mask = graph_mask.view(1, 1, num_nodes, num_nodes)
-            elif graph_mask.dim() == 3:
-                graph_mask = graph_mask | eye_mask.view(1, num_nodes, num_nodes)
-                if graph_mask.shape[0] == 1 and batch_size > 1:
-                    graph_mask = graph_mask.expand(batch_size, -1, -1)
-                if graph_mask.shape[0] != batch_size:
-                    raise ValueError("Batch graph mask size does not match node_state batch size.")
-                graph_mask = graph_mask.view(batch_size, 1, num_nodes, num_nodes)
-            else:
-                raise ValueError("adj_for_run must be a 2D or 3D adjacency tensor.")
+            graph_mask = self._prepare_graph_mask(adj_for_run, batch_size, num_nodes, node_state.device)
+            if self.edge_bias:
+                edge_bias = self._prepare_edge_bias(
+                    adj_for_run,
+                    batch_size,
+                    num_nodes,
+                    node_state.device,
+                    scores.dtype,
+                )
+                scores = scores + self.edge_bias_scale.to(dtype=scores.dtype) * edge_bias
             scores = scores.masked_fill(~graph_mask, -1e9)
         attn = torch.softmax(scores, dim=-1)
         attn = self.dropout(attn)
@@ -332,6 +376,9 @@ class ASTTCNResidualBranch(nn.Module):
         residual_gate=False,
         residual_gate_hidden_dim=16,
         residual_gate_init=0.2,
+        edge_bias=False,
+        edge_bias_init=0.1,
+        edge_bias_eps=1e-6,
     ):
         super(ASTTCNResidualBranch, self).__init__()
         self.num_for_predict = int(num_for_predict)
@@ -353,6 +400,9 @@ class ASTTCNResidualBranch(nn.Module):
             hidden_dim=int(hidden_dim),
             heads=int(heads),
             dropout=float(dropout),
+            edge_bias=edge_bias,
+            edge_bias_init=edge_bias_init,
+            edge_bias_eps=edge_bias_eps,
         )
         self.stim_gate = nn.Sequential(
             nn.Linear(int(hidden_dim) * 2, int(hidden_dim)),
@@ -571,6 +621,9 @@ class MSTGCN_submodule(nn.Module):
         ast_tcn_residual_gate=False,
         ast_tcn_residual_gate_hidden_dim=16,
         ast_tcn_residual_gate_init=0.2,
+        ast_tcn_edge_bias=False,
+        ast_tcn_edge_bias_init=0.1,
+        ast_tcn_edge_bias_eps=1e-6,
     ):
 
 
@@ -684,6 +737,9 @@ class MSTGCN_submodule(nn.Module):
                 residual_gate=ast_tcn_residual_gate,
                 residual_gate_hidden_dim=ast_tcn_residual_gate_hidden_dim,
                 residual_gate_init=ast_tcn_residual_gate_init,
+                edge_bias=ast_tcn_edge_bias,
+                edge_bias_init=ast_tcn_edge_bias_init,
+                edge_bias_eps=ast_tcn_edge_bias_eps,
             )
 
         self.DEVICE = DEVICE
