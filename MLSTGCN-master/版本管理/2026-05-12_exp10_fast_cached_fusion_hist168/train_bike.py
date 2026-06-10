@@ -219,6 +219,7 @@ parser.add_argument('--ast_tcn_dropout', type=float, default=0.1)
 parser.add_argument('--ast_tcn_residual_init', type=float, default=0.05)
 parser.add_argument('--ast_tcn_bounded_alpha', default='false', help="Use 'true' or 'false' to bound the AST-TCN residual scale.")
 parser.add_argument('--ast_tcn_alpha_max', type=float, default=0.1)
+parser.add_argument('--ast_tcn_horizon_alpha', default='false', help="Use 'true' or 'false' to learn one AST-TCN residual alpha per prediction horizon.")
 parser.add_argument('--ast_tcn_zero_init', default='false', help="Use 'true' or 'false' to zero-init the AST-TCN residual output head.")
 parser.add_argument('--ast_tcn_residual_gate', default='false', help="Use 'true' or 'false' to learn a dynamic gate for the AST-TCN residual branch.")
 parser.add_argument('--ast_tcn_residual_gate_hidden_dim', type=int, default=16)
@@ -310,6 +311,7 @@ args.anchor_homogeneous_batches = parse_bool_arg(args.anchor_homogeneous_batches
 args.trend_alignment_decoder = parse_bool_arg(args.trend_alignment_decoder, '--trend_alignment_decoder')
 args.ast_tcn_residual = parse_bool_arg(args.ast_tcn_residual, '--ast_tcn_residual')
 args.ast_tcn_bounded_alpha = parse_bool_arg(args.ast_tcn_bounded_alpha, '--ast_tcn_bounded_alpha')
+args.ast_tcn_horizon_alpha = parse_bool_arg(args.ast_tcn_horizon_alpha, '--ast_tcn_horizon_alpha')
 args.ast_tcn_zero_init = parse_bool_arg(args.ast_tcn_zero_init, '--ast_tcn_zero_init')
 args.ast_tcn_residual_gate = parse_bool_arg(args.ast_tcn_residual_gate, '--ast_tcn_residual_gate')
 args.ast_tcn_edge_bias = parse_bool_arg(args.ast_tcn_edge_bias, '--ast_tcn_edge_bias')
@@ -492,6 +494,7 @@ hyperparameter_defaults = dict(
         ast_tcn_residual_init=args.ast_tcn_residual_init,
         ast_tcn_bounded_alpha=args.ast_tcn_bounded_alpha,
         ast_tcn_alpha_max=args.ast_tcn_alpha_max,
+        ast_tcn_horizon_alpha=args.ast_tcn_horizon_alpha,
         ast_tcn_zero_init=args.ast_tcn_zero_init,
         ast_tcn_residual_gate=args.ast_tcn_residual_gate,
         ast_tcn_residual_gate_hidden_dim=args.ast_tcn_residual_gate_hidden_dim,
@@ -1035,6 +1038,7 @@ class LightningModel(LightningModule):
                 ast_tcn_residual_init=config['model']['ast_tcn_residual_init'],
                 ast_tcn_bounded_alpha=config['model']['ast_tcn_bounded_alpha'],
                 ast_tcn_alpha_max=config['model']['ast_tcn_alpha_max'],
+                ast_tcn_horizon_alpha=config['model']['ast_tcn_horizon_alpha'],
                 ast_tcn_zero_init=config['model']['ast_tcn_zero_init'],
                 ast_tcn_residual_gate=config['model']['ast_tcn_residual_gate'],
                 ast_tcn_residual_gate_hidden_dim=config['model']['ast_tcn_residual_gate_hidden_dim'],

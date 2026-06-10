@@ -372,6 +372,7 @@ class ASTTCNResidualBranch(nn.Module):
         residual_init=0.05,
         bounded_alpha=False,
         alpha_max=0.1,
+        horizon_alpha=False,
         zero_init=False,
         residual_gate=False,
         residual_gate_hidden_dim=16,
@@ -385,6 +386,7 @@ class ASTTCNResidualBranch(nn.Module):
         self.out_dim = int(out_dim)
         self.bounded_alpha = bool(bounded_alpha)
         self.alpha_max = float(alpha_max)
+        self.horizon_alpha = bool(horizon_alpha)
         self.use_residual_gate = bool(residual_gate)
         self.input_proj = nn.Linear(int(in_channels), int(hidden_dim))
         self.temporal_blocks = nn.ModuleList([
@@ -439,14 +441,28 @@ class ASTTCNResidualBranch(nn.Module):
             init_ratio = float(residual_init) / self.alpha_max
             init_ratio = min(max(init_ratio, 1e-4), 1.0 - 1e-4)
             raw_init = math.log(init_ratio / (1.0 - init_ratio))
-            self.residual_alpha = nn.Parameter(torch.tensor(raw_init, dtype=torch.float32))
+            if self.horizon_alpha:
+                init_value = torch.full((self.num_for_predict,), raw_init, dtype=torch.float32)
+            else:
+                init_value = torch.tensor(raw_init, dtype=torch.float32)
+            self.residual_alpha = nn.Parameter(init_value)
         else:
-            self.residual_alpha = nn.Parameter(torch.tensor(float(residual_init), dtype=torch.float32))
+            if self.horizon_alpha:
+                init_value = torch.full((self.num_for_predict,), float(residual_init), dtype=torch.float32)
+            else:
+                init_value = torch.tensor(float(residual_init), dtype=torch.float32)
+            self.residual_alpha = nn.Parameter(init_value)
 
     def residual_scale(self):
         if self.bounded_alpha:
             return self.alpha_max * torch.sigmoid(self.residual_alpha)
         return self.residual_alpha
+
+    def residual_scale_for_output(self):
+        scale = self.residual_scale()
+        if self.horizon_alpha:
+            return scale.view(1, self.num_for_predict, 1, 1)
+        return scale
 
     def forward(self, x, adj_for_run=None):
         # x: (B, N, F, T). This branch predicts a small residual in scaled target space.
@@ -465,7 +481,7 @@ class ASTTCNResidualBranch(nn.Module):
         if self.use_residual_gate:
             residual_gate = self.residual_gate(torch.cat([spatial_state, temporal_state], dim=-1))
             residual = residual * residual_gate.permute(0, 2, 1).unsqueeze(-1)
-        return self.residual_scale() * residual
+        return self.residual_scale_for_output() * residual
 
 
 class cheb_conv(nn.Module):
@@ -617,6 +633,7 @@ class MSTGCN_submodule(nn.Module):
         ast_tcn_residual_init=0.05,
         ast_tcn_bounded_alpha=False,
         ast_tcn_alpha_max=0.1,
+        ast_tcn_horizon_alpha=False,
         ast_tcn_zero_init=False,
         ast_tcn_residual_gate=False,
         ast_tcn_residual_gate_hidden_dim=16,
@@ -733,6 +750,7 @@ class MSTGCN_submodule(nn.Module):
                 residual_init=ast_tcn_residual_init,
                 bounded_alpha=ast_tcn_bounded_alpha,
                 alpha_max=ast_tcn_alpha_max,
+                horizon_alpha=ast_tcn_horizon_alpha,
                 zero_init=ast_tcn_zero_init,
                 residual_gate=ast_tcn_residual_gate,
                 residual_gate_hidden_dim=ast_tcn_residual_gate_hidden_dim,
