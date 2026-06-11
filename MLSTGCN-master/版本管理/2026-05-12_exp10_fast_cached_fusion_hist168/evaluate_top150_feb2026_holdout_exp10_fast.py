@@ -81,6 +81,16 @@ class EvalWrapper(nn.Module):
                 ast_tcn_heads=model_config.get("ast_tcn_heads", 4),
                 ast_tcn_dropout=model_config.get("ast_tcn_dropout", 0.1),
                 ast_tcn_residual_init=model_config.get("ast_tcn_residual_init", 0.05),
+                ast_tcn_bounded_alpha=model_config.get("ast_tcn_bounded_alpha", False),
+                ast_tcn_alpha_max=model_config.get("ast_tcn_alpha_max", 0.1),
+                ast_tcn_horizon_alpha=model_config.get("ast_tcn_horizon_alpha", False),
+                ast_tcn_zero_init=model_config.get("ast_tcn_zero_init", False),
+                ast_tcn_residual_gate=model_config.get("ast_tcn_residual_gate", False),
+                ast_tcn_residual_gate_hidden_dim=model_config.get("ast_tcn_residual_gate_hidden_dim", 16),
+                ast_tcn_residual_gate_init=model_config.get("ast_tcn_residual_gate_init", 0.2),
+                ast_tcn_edge_bias=model_config.get("ast_tcn_edge_bias", False),
+                ast_tcn_edge_bias_init=model_config.get("ast_tcn_edge_bias_init", 0.1),
+                ast_tcn_edge_bias_eps=model_config.get("ast_tcn_edge_bias_eps", 1e-6),
             )
         elif model_config.get("use") == "D2STGNN":
             self.model = D2STGNNFusionBackbone(
@@ -467,6 +477,7 @@ def main():
     parser.add_argument("--anchor_hours", default="0,6,12,16,20", help="Optional comma-separated decision anchors, e.g. 0,6,12,16,20.")
     parser.add_argument("--target_start_offset", type=int, default=1, help="For rolling anchors, decision t predicts t+offset...")
     parser.add_argument("--graph_use", default=None, help="Optional comma-separated graph list. Defaults to recovered training graph_use.")
+    parser.add_argument("--hgaurban_graph_prior_path", default=None, help="Optional path to hgaurban_graph_prior.npy for graph_use=hgaurban.")
     parser.add_argument("--batch_size", type=int, default=4, help="Evaluation batch size. Use 1 for batch-level dynamic graph gates.")
     parser.add_argument("--context_gate", default=None, help="Optional true/false override for recovered context gate.")
     parser.add_argument("--context_gate_hidden_dim", type=int, default=None)
@@ -484,6 +495,16 @@ def main():
     parser.add_argument("--ast_tcn_heads", type=int, default=None)
     parser.add_argument("--ast_tcn_dropout", type=float, default=None)
     parser.add_argument("--ast_tcn_residual_init", type=float, default=None)
+    parser.add_argument("--ast_tcn_bounded_alpha", default=None, help="Optional true/false override for bounded AST-TCN residual scale.")
+    parser.add_argument("--ast_tcn_alpha_max", type=float, default=None)
+    parser.add_argument("--ast_tcn_horizon_alpha", default=None, help="Optional true/false override for horizon-specific AST-TCN residual alpha.")
+    parser.add_argument("--ast_tcn_zero_init", default=None, help="Optional true/false override for zero-init AST-TCN output head.")
+    parser.add_argument("--ast_tcn_residual_gate", default=None, help="Optional true/false override for dynamic AST-TCN residual gate.")
+    parser.add_argument("--ast_tcn_residual_gate_hidden_dim", type=int, default=None)
+    parser.add_argument("--ast_tcn_residual_gate_init", type=float, default=None)
+    parser.add_argument("--ast_tcn_edge_bias", default=None, help="Optional true/false override for graph edge-bias spatial attention.")
+    parser.add_argument("--ast_tcn_edge_bias_init", type=float, default=None)
+    parser.add_argument("--ast_tcn_edge_bias_eps", type=float, default=None)
     args = parser.parse_args()
 
     data_dir = PROJECT_ROOT / args.data_dir
@@ -609,6 +630,15 @@ def main():
         recovered_graph_use = parse_graph_use(get_cli_value(training_metadata.get("entry_args"), "--graph_use"))
     if recovered_graph_use is None:
         recovered_graph_use = ["dist", "neighb", "distri", "tempp", "func", "od00", "od06", "od12", "od16", "od20"]
+    hgaurban_graph_prior_path = (
+        args.hgaurban_graph_prior_path
+        if args.hgaurban_graph_prior_path is not None
+        else cli_value_or_default(training_metadata, "--hgaurban_graph_prior_path", "")
+    )
+    if hgaurban_graph_prior_path:
+        hgaurban_graph_prior_path = str(Path(hgaurban_graph_prior_path))
+        if not Path(hgaurban_graph_prior_path).is_absolute():
+            hgaurban_graph_prior_path = str(PROJECT_ROOT / hgaurban_graph_prior_path)
     context_gate = parse_bool_value(
         args.context_gate if args.context_gate is not None else cli_value_or_default(training_metadata, "--context_gate"),
         default=False,
@@ -664,6 +694,7 @@ def main():
         "context_gate_anchor_embed_dim": context_gate_anchor_embed_dim,
         "context_gate_anchor_od_prior": context_gate_anchor_od_prior,
         "context_gate_scope": context_gate_scope,
+        "hgaurban_graph_prior_path": hgaurban_graph_prior_path,
         "distri_type": "exp",
         "func_type": "ours",
         "attention": True,
@@ -738,6 +769,61 @@ def main():
             args.ast_tcn_residual_init
             if args.ast_tcn_residual_init is not None
             else cli_value_or_default(training_metadata, "--ast_tcn_residual_init", 0.05)
+        ),
+        "ast_tcn_bounded_alpha": parse_bool_value(
+            args.ast_tcn_bounded_alpha
+            if args.ast_tcn_bounded_alpha is not None
+            else cli_value_or_default(training_metadata, "--ast_tcn_bounded_alpha"),
+            default=False,
+        ),
+        "ast_tcn_alpha_max": float(
+            args.ast_tcn_alpha_max
+            if args.ast_tcn_alpha_max is not None
+            else cli_value_or_default(training_metadata, "--ast_tcn_alpha_max", 0.1)
+        ),
+        "ast_tcn_horizon_alpha": parse_bool_value(
+            args.ast_tcn_horizon_alpha
+            if args.ast_tcn_horizon_alpha is not None
+            else cli_value_or_default(training_metadata, "--ast_tcn_horizon_alpha"),
+            default=False,
+        ),
+        "ast_tcn_zero_init": parse_bool_value(
+            args.ast_tcn_zero_init
+            if args.ast_tcn_zero_init is not None
+            else cli_value_or_default(training_metadata, "--ast_tcn_zero_init"),
+            default=False,
+        ),
+        "ast_tcn_residual_gate": parse_bool_value(
+            args.ast_tcn_residual_gate
+            if args.ast_tcn_residual_gate is not None
+            else cli_value_or_default(training_metadata, "--ast_tcn_residual_gate"),
+            default=False,
+        ),
+        "ast_tcn_residual_gate_hidden_dim": int(
+            args.ast_tcn_residual_gate_hidden_dim
+            if args.ast_tcn_residual_gate_hidden_dim is not None
+            else cli_value_or_default(training_metadata, "--ast_tcn_residual_gate_hidden_dim", 16)
+        ),
+        "ast_tcn_residual_gate_init": float(
+            args.ast_tcn_residual_gate_init
+            if args.ast_tcn_residual_gate_init is not None
+            else cli_value_or_default(training_metadata, "--ast_tcn_residual_gate_init", 0.2)
+        ),
+        "ast_tcn_edge_bias": parse_bool_value(
+            args.ast_tcn_edge_bias
+            if args.ast_tcn_edge_bias is not None
+            else cli_value_or_default(training_metadata, "--ast_tcn_edge_bias"),
+            default=False,
+        ),
+        "ast_tcn_edge_bias_init": float(
+            args.ast_tcn_edge_bias_init
+            if args.ast_tcn_edge_bias_init is not None
+            else cli_value_or_default(training_metadata, "--ast_tcn_edge_bias_init", 0.1)
+        ),
+        "ast_tcn_edge_bias_eps": float(
+            args.ast_tcn_edge_bias_eps
+            if args.ast_tcn_edge_bias_eps is not None
+            else cli_value_or_default(training_metadata, "--ast_tcn_edge_bias_eps", 1e-6)
         ),
         "d2_hidden_dim": int(cli_value_or_default(training_metadata, "--d2_hidden_dim", 64)),
         "d2_num_layers": int(cli_value_or_default(training_metadata, "--d2_num_layers", 4)),
@@ -908,6 +994,16 @@ def main():
         "ast_tcn_heads": model_config["ast_tcn_heads"],
         "ast_tcn_dropout": model_config["ast_tcn_dropout"],
         "ast_tcn_residual_init": model_config["ast_tcn_residual_init"],
+        "ast_tcn_bounded_alpha": model_config["ast_tcn_bounded_alpha"],
+        "ast_tcn_alpha_max": model_config["ast_tcn_alpha_max"],
+        "ast_tcn_horizon_alpha": model_config["ast_tcn_horizon_alpha"],
+        "ast_tcn_zero_init": model_config["ast_tcn_zero_init"],
+        "ast_tcn_residual_gate": model_config["ast_tcn_residual_gate"],
+        "ast_tcn_residual_gate_hidden_dim": model_config["ast_tcn_residual_gate_hidden_dim"],
+        "ast_tcn_residual_gate_init": model_config["ast_tcn_residual_gate_init"],
+        "ast_tcn_edge_bias": model_config["ast_tcn_edge_bias"],
+        "ast_tcn_edge_bias_init": model_config["ast_tcn_edge_bias_init"],
+        "ast_tcn_edge_bias_eps": model_config["ast_tcn_edge_bias_eps"],
         "trip_files": trip_files,
         "date_start": str(eval_dates[0]),
         "date_end": str(eval_dates[-1]),

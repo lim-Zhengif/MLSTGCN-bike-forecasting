@@ -5,6 +5,24 @@ import sys
 PROJ_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(PROJ_DIR)
 
+
+def detect_project_root(start_dir):
+    current = os.path.abspath(start_dir)
+    while True:
+        if (
+            os.path.isdir(os.path.join(current, 'data'))
+            and os.path.isdir(os.path.join(current, 'models'))
+            and os.path.isdir(os.path.join(current, 'datasets'))
+        ):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return os.path.abspath(start_dir)
+        current = parent
+
+
+PROJECT_ROOT = detect_project_root(PROJ_DIR)
+
 import numpy as np
 import torch
 from torch.utils import data
@@ -20,6 +38,7 @@ class BikeGraph:
         use_graph = config_graph['use']
         fix_weight = config_graph['fix_weight']
         tempp_diag_zero = config_graph['tempp_diag_zero']
+        hgaurban_graph_prior_path = config_graph.get('hgaurban_graph_prior_path') or ''
 
         self.A_dist = torch.from_numpy(
             np.float32(np.load(os.path.join(graph_dir, 'dist.npy')))
@@ -43,6 +62,26 @@ class BikeGraph:
                 continue
             self.extra_graphs[graph_name] = torch.from_numpy(
                 np.float32(np.load(os.path.join(graph_dir, graph_file)))
+            ).to(self.device)
+        if 'hgaurban' in use_graph:
+            if not hgaurban_graph_prior_path:
+                hgaurban_graph_prior_path = os.path.join(graph_dir, 'hgaurban_graph_prior.npy')
+            if not os.path.isabs(hgaurban_graph_prior_path):
+                candidate_paths = [
+                    os.path.join(graph_dir, hgaurban_graph_prior_path),
+                    os.path.join(PROJECT_ROOT, hgaurban_graph_prior_path),
+                    os.path.join(PROJ_DIR, hgaurban_graph_prior_path),
+                ]
+                hgaurban_graph_prior_path = next(
+                    (path for path in candidate_paths if os.path.exists(path)),
+                    candidate_paths[0],
+                )
+            if not os.path.exists(hgaurban_graph_prior_path):
+                raise FileNotFoundError(
+                    'Missing HGAurban graph prior for graph_use=hgaurban: %s' % hgaurban_graph_prior_path
+                )
+            self.extra_graphs['hgaurban'] = torch.from_numpy(
+                np.float32(np.load(hgaurban_graph_prior_path))
             ).to(self.device)
 
         self.node_num = self.A_dist.shape[0]
