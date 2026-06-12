@@ -373,6 +373,7 @@ class ASTTCNResidualBranch(nn.Module):
         bounded_alpha=False,
         alpha_max=0.1,
         horizon_alpha=False,
+        residual_horizon_mask=None,
         zero_init=False,
         residual_gate=False,
         residual_gate_hidden_dim=16,
@@ -388,6 +389,21 @@ class ASTTCNResidualBranch(nn.Module):
         self.alpha_max = float(alpha_max)
         self.horizon_alpha = bool(horizon_alpha)
         self.use_residual_gate = bool(residual_gate)
+        if residual_horizon_mask is None or residual_horizon_mask == "":
+            mask = torch.ones(self.num_for_predict, dtype=torch.float32)
+        elif isinstance(residual_horizon_mask, str):
+            mask = torch.tensor(
+                [float(item.strip()) for item in residual_horizon_mask.split(",") if item.strip()],
+                dtype=torch.float32,
+            )
+        else:
+            mask = torch.tensor(list(residual_horizon_mask), dtype=torch.float32)
+        if mask.numel() != self.num_for_predict:
+            raise ValueError(
+                "residual_horizon_mask length must match num_for_predict: %d vs %d"
+                % (mask.numel(), self.num_for_predict)
+            )
+        self.register_buffer("residual_horizon_mask", mask.view(1, self.num_for_predict, 1, 1))
         self.input_proj = nn.Linear(int(in_channels), int(hidden_dim))
         self.temporal_blocks = nn.ModuleList([
             CausalGatedTemporalBlock(
@@ -481,6 +497,7 @@ class ASTTCNResidualBranch(nn.Module):
         if self.use_residual_gate:
             residual_gate = self.residual_gate(torch.cat([spatial_state, temporal_state], dim=-1))
             residual = residual * residual_gate.permute(0, 2, 1).unsqueeze(-1)
+        residual = residual * self.residual_horizon_mask.to(dtype=residual.dtype)
         return self.residual_scale_for_output() * residual
 
 
@@ -634,6 +651,7 @@ class MSTGCN_submodule(nn.Module):
         ast_tcn_bounded_alpha=False,
         ast_tcn_alpha_max=0.1,
         ast_tcn_horizon_alpha=False,
+        ast_tcn_residual_horizon_mask=None,
         ast_tcn_zero_init=False,
         ast_tcn_residual_gate=False,
         ast_tcn_residual_gate_hidden_dim=16,
@@ -751,6 +769,7 @@ class MSTGCN_submodule(nn.Module):
                 bounded_alpha=ast_tcn_bounded_alpha,
                 alpha_max=ast_tcn_alpha_max,
                 horizon_alpha=ast_tcn_horizon_alpha,
+                residual_horizon_mask=ast_tcn_residual_horizon_mask,
                 zero_init=ast_tcn_zero_init,
                 residual_gate=ast_tcn_residual_gate,
                 residual_gate_hidden_dim=ast_tcn_residual_gate_hidden_dim,

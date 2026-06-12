@@ -84,6 +84,7 @@ class EvalWrapper(nn.Module):
                 ast_tcn_bounded_alpha=model_config.get("ast_tcn_bounded_alpha", False),
                 ast_tcn_alpha_max=model_config.get("ast_tcn_alpha_max", 0.1),
                 ast_tcn_horizon_alpha=model_config.get("ast_tcn_horizon_alpha", False),
+                ast_tcn_residual_horizon_mask=model_config.get("ast_tcn_residual_horizon_mask", None),
                 ast_tcn_zero_init=model_config.get("ast_tcn_zero_init", False),
                 ast_tcn_residual_gate=model_config.get("ast_tcn_residual_gate", False),
                 ast_tcn_residual_gate_hidden_dim=model_config.get("ast_tcn_residual_gate_hidden_dim", 16),
@@ -432,6 +433,14 @@ def parse_bool_value(value, default=False):
     return default
 
 
+def parse_float_list(value):
+    if value is None or str(value).strip() == "":
+        return []
+    if isinstance(value, (list, tuple)):
+        return [float(item) for item in value]
+    return [float(item.strip()) for item in str(value).split(",") if item.strip()]
+
+
 def cli_value_or_default(training_metadata, flag, default=None):
     value = get_cli_value(training_metadata.get("resolved_train_argv"), flag)
     if value is not None:
@@ -498,6 +507,7 @@ def main():
     parser.add_argument("--ast_tcn_bounded_alpha", default=None, help="Optional true/false override for bounded AST-TCN residual scale.")
     parser.add_argument("--ast_tcn_alpha_max", type=float, default=None)
     parser.add_argument("--ast_tcn_horizon_alpha", default=None, help="Optional true/false override for horizon-specific AST-TCN residual alpha.")
+    parser.add_argument("--ast_tcn_residual_horizon_mask", default=None, help="Optional comma-separated AST-TCN residual mask per horizon, e.g. 1,0,1.")
     parser.add_argument("--ast_tcn_zero_init", default=None, help="Optional true/false override for zero-init AST-TCN output head.")
     parser.add_argument("--ast_tcn_residual_gate", default=None, help="Optional true/false override for dynamic AST-TCN residual gate.")
     parser.add_argument("--ast_tcn_residual_gate_hidden_dim", type=int, default=None)
@@ -787,6 +797,11 @@ def main():
             else cli_value_or_default(training_metadata, "--ast_tcn_horizon_alpha"),
             default=False,
         ),
+        "ast_tcn_residual_horizon_mask": parse_float_list(
+            args.ast_tcn_residual_horizon_mask
+            if args.ast_tcn_residual_horizon_mask is not None
+            else cli_value_or_default(training_metadata, "--ast_tcn_residual_horizon_mask", "")
+        ),
         "ast_tcn_zero_init": parse_bool_value(
             args.ast_tcn_zero_init
             if args.ast_tcn_zero_init is not None
@@ -997,6 +1012,7 @@ def main():
         "ast_tcn_bounded_alpha": model_config["ast_tcn_bounded_alpha"],
         "ast_tcn_alpha_max": model_config["ast_tcn_alpha_max"],
         "ast_tcn_horizon_alpha": model_config["ast_tcn_horizon_alpha"],
+        "ast_tcn_residual_horizon_mask": model_config["ast_tcn_residual_horizon_mask"],
         "ast_tcn_zero_init": model_config["ast_tcn_zero_init"],
         "ast_tcn_residual_gate": model_config["ast_tcn_residual_gate"],
         "ast_tcn_residual_gate_hidden_dim": model_config["ast_tcn_residual_gate_hidden_dim"],

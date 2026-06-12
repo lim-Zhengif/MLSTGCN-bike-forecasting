@@ -225,6 +225,7 @@ parser.add_argument('--ast_tcn_residual_init', type=float, default=0.05)
 parser.add_argument('--ast_tcn_bounded_alpha', default='false', help="Use 'true' or 'false' to bound the AST-TCN residual scale.")
 parser.add_argument('--ast_tcn_alpha_max', type=float, default=0.1)
 parser.add_argument('--ast_tcn_horizon_alpha', default='false', help="Use 'true' or 'false' to learn one AST-TCN residual alpha per prediction horizon.")
+parser.add_argument('--ast_tcn_residual_horizon_mask', default='', help="Comma-separated fixed AST-TCN residual mask per horizon, e.g. '1,0,1' for pred_len=3.")
 parser.add_argument('--ast_tcn_zero_init', default='false', help="Use 'true' or 'false' to zero-init the AST-TCN residual output head.")
 parser.add_argument('--ast_tcn_residual_gate', default='false', help="Use 'true' or 'false' to learn a dynamic gate for the AST-TCN residual branch.")
 parser.add_argument('--ast_tcn_residual_gate_hidden_dim', type=int, default=16)
@@ -305,6 +306,21 @@ def parse_anchor_hour_list(value):
     return hours
 
 
+def parse_float_list(value, flag_name):
+    if value is None or str(value).strip() == '':
+        return []
+    values = []
+    for item in str(value).split(','):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            values.append(float(item))
+        except ValueError:
+            parser.error('%s only accepts comma-separated numbers, got: %s' % (flag_name, item))
+    return values
+
+
 args.graph_attention = parse_bool_arg(args.graph_attention, '--graph_attention')
 args.matrix_weight = parse_bool_arg(args.matrix_weight, '--matrix_weight')
 args.graph_fix_weight = parse_bool_arg(args.graph_fix_weight, '--graph_fix_weight')
@@ -327,6 +343,10 @@ args.d2_use_reverse = parse_bool_arg(args.d2_use_reverse, '--d2_use_reverse')
 args.graph_use = parse_graph_use_arg(args.graph_use)
 args.peak_anchor_hours = parse_anchor_hour_list(args.peak_anchor_hours)
 args.train_anchor_hours = parse_anchor_hour_list(args.train_anchor_hours)
+args.ast_tcn_residual_horizon_mask = parse_float_list(
+    args.ast_tcn_residual_horizon_mask,
+    '--ast_tcn_residual_horizon_mask',
+)
 
 if args.graph_topk < 0:
     parser.error('--graph_topk must be >= 0.')
@@ -378,6 +398,8 @@ if args.ast_tcn_alpha_max <= 0:
     parser.error('--ast_tcn_alpha_max must be > 0.')
 if args.ast_tcn_bounded_alpha and not (0.0 <= args.ast_tcn_residual_init <= args.ast_tcn_alpha_max):
     parser.error('--ast_tcn_residual_init must be within [0, --ast_tcn_alpha_max] when --ast_tcn_bounded_alpha true.')
+if args.ast_tcn_residual_horizon_mask and len(args.ast_tcn_residual_horizon_mask) != args.pred_len:
+    parser.error('--ast_tcn_residual_horizon_mask length must match --pred_len.')
 if args.ast_tcn_residual_gate_hidden_dim <= 0:
     parser.error('--ast_tcn_residual_gate_hidden_dim must be > 0.')
 if not (0.0 < args.ast_tcn_residual_gate_init < 1.0):
@@ -502,6 +524,7 @@ hyperparameter_defaults = dict(
         ast_tcn_bounded_alpha=args.ast_tcn_bounded_alpha,
         ast_tcn_alpha_max=args.ast_tcn_alpha_max,
         ast_tcn_horizon_alpha=args.ast_tcn_horizon_alpha,
+        ast_tcn_residual_horizon_mask=args.ast_tcn_residual_horizon_mask,
         ast_tcn_zero_init=args.ast_tcn_zero_init,
         ast_tcn_residual_gate=args.ast_tcn_residual_gate,
         ast_tcn_residual_gate_hidden_dim=args.ast_tcn_residual_gate_hidden_dim,
@@ -1051,6 +1074,7 @@ class LightningModel(LightningModule):
                 ast_tcn_bounded_alpha=config['model']['ast_tcn_bounded_alpha'],
                 ast_tcn_alpha_max=config['model']['ast_tcn_alpha_max'],
                 ast_tcn_horizon_alpha=config['model']['ast_tcn_horizon_alpha'],
+                ast_tcn_residual_horizon_mask=config['model']['ast_tcn_residual_horizon_mask'],
                 ast_tcn_zero_init=config['model']['ast_tcn_zero_init'],
                 ast_tcn_residual_gate=config['model']['ast_tcn_residual_gate'],
                 ast_tcn_residual_gate_hidden_dim=config['model']['ast_tcn_residual_gate_hidden_dim'],
