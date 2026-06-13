@@ -389,7 +389,15 @@ class ASTTCNResidualBranch(nn.Module):
         self.alpha_max = float(alpha_max)
         self.horizon_alpha = bool(horizon_alpha)
         self.use_residual_gate = bool(residual_gate)
-        if residual_horizon_mask is None or residual_horizon_mask == "":
+        if (
+            residual_horizon_mask is None
+            or residual_horizon_mask == ""
+            or (
+                not isinstance(residual_horizon_mask, str)
+                and hasattr(residual_horizon_mask, "__len__")
+                and len(residual_horizon_mask) == 0
+            )
+        ):
             mask = torch.ones(self.num_for_predict, dtype=torch.float32)
         elif isinstance(residual_horizon_mask, str):
             mask = torch.tensor(
