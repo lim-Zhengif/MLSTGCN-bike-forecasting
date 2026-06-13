@@ -229,6 +229,11 @@ parser.add_argument('--trend_time_cycle', type=int, default=24, help='Number of 
 parser.add_argument('--trend_time_embed_dim', type=int, default=16)
 parser.add_argument('--trend_attention_heads', type=int, default=4)
 parser.add_argument('--trend_dropout', type=float, default=0.1)
+parser.add_argument(
+    '--horizon_specific_prediction_head',
+    default='false',
+    help="Use 'true' to replace the shared final prediction head with one output head per horizon.",
+)
 parser.add_argument('--ast_tcn_residual', default='false', help="Use 'true' or 'false' to add an AST-TCN-inspired residual branch to MSTGCN.")
 parser.add_argument('--ast_tcn_hidden_dim', type=int, default=32)
 parser.add_argument('--ast_tcn_layers', type=int, default=4)
@@ -347,6 +352,10 @@ args.context_gate_anchor_hour = parse_bool_arg(args.context_gate_anchor_hour, '-
 args.anchor_homogeneous_batches = parse_bool_arg(args.anchor_homogeneous_batches, '--anchor_homogeneous_batches')
 args.freeze_non_ast_tcn = parse_bool_arg(args.freeze_non_ast_tcn, '--freeze_non_ast_tcn')
 args.trend_alignment_decoder = parse_bool_arg(args.trend_alignment_decoder, '--trend_alignment_decoder')
+args.horizon_specific_prediction_head = parse_bool_arg(
+    args.horizon_specific_prediction_head,
+    '--horizon_specific_prediction_head',
+)
 args.ast_tcn_residual = parse_bool_arg(args.ast_tcn_residual, '--ast_tcn_residual')
 args.ast_tcn_bounded_alpha = parse_bool_arg(args.ast_tcn_bounded_alpha, '--ast_tcn_bounded_alpha')
 args.ast_tcn_horizon_alpha = parse_bool_arg(args.ast_tcn_horizon_alpha, '--ast_tcn_horizon_alpha')
@@ -398,6 +407,8 @@ if args.trend_time_embed_dim <= 0:
     parser.error('--trend_time_embed_dim must be > 0.')
 if args.trend_attention_heads <= 0:
     parser.error('--trend_attention_heads must be > 0.')
+if args.trend_alignment_decoder and args.horizon_specific_prediction_head:
+    parser.error('--horizon_specific_prediction_head is only supported with the standard final prediction head, not --trend_alignment_decoder.')
 if args.ast_tcn_hidden_dim <= 0:
     parser.error('--ast_tcn_hidden_dim must be > 0.')
 if args.ast_tcn_layers <= 0:
@@ -531,6 +542,7 @@ hyperparameter_defaults = dict(
         trend_time_embed_dim=args.trend_time_embed_dim,
         trend_attention_heads=args.trend_attention_heads,
         trend_dropout=args.trend_dropout,
+        horizon_specific_prediction_head=args.horizon_specific_prediction_head,
         ast_tcn_residual=args.ast_tcn_residual,
         ast_tcn_hidden_dim=args.ast_tcn_hidden_dim,
         ast_tcn_layers=args.ast_tcn_layers,
@@ -1083,6 +1095,7 @@ class LightningModel(LightningModule):
                 trend_time_embed_dim=config['model']['trend_time_embed_dim'],
                 trend_attention_heads=config['model']['trend_attention_heads'],
                 trend_dropout=config['model']['trend_dropout'],
+                horizon_specific_prediction_head=config['model']['horizon_specific_prediction_head'],
                 ast_tcn_residual=config['model']['ast_tcn_residual'],
                 ast_tcn_hidden_dim=config['model']['ast_tcn_hidden_dim'],
                 ast_tcn_layers=config['model']['ast_tcn_layers'],
@@ -1308,6 +1321,7 @@ def main():
         if trainable_scope == 'ast_tcn_final_head':
             trainable_prefixes.extend([
                 'model.final_conv.',
+                'model.horizon_final_convs.',
                 'model.trend_decoder.',
             ])
         trainable_names = []

@@ -648,6 +648,7 @@ class MSTGCN_submodule(nn.Module):
         trend_time_embed_dim=16,
         trend_attention_heads=4,
         trend_dropout=0.1,
+        horizon_specific_prediction_head=False,
         ast_tcn_residual=False,
         ast_tcn_hidden_dim=32,
         ast_tcn_layers=4,
@@ -741,6 +742,7 @@ class MSTGCN_submodule(nn.Module):
         ])
 
         self.use_trend_alignment_decoder = bool(trend_alignment_decoder)
+        self.use_horizon_specific_prediction_head = bool(horizon_specific_prediction_head)
         if self.use_trend_alignment_decoder:
             self.trend_decoder = TrendAlignmentDecoder(
                 hidden_dim=nb_time_filter,
@@ -754,6 +756,15 @@ class MSTGCN_submodule(nn.Module):
                 attention_heads=trend_attention_heads,
                 dropout=trend_dropout,
             )
+        elif self.use_horizon_specific_prediction_head:
+            self.horizon_final_convs = nn.ModuleList([
+                nn.Conv2d(
+                    int(len_input / time_strides),
+                    out_dim,
+                    kernel_size=(1, nb_time_filter),
+                )
+                for _ in range(num_for_predict)
+            ])
         else:
             self.final_conv = nn.Conv2d(
                 int(len_input / time_strides),
@@ -812,6 +823,14 @@ class MSTGCN_submodule(nn.Module):
 
         if self.use_trend_alignment_decoder:
             output = self.trend_decoder(x, context_x)
+        elif self.use_horizon_specific_prediction_head:
+            decoder_x = x.permute(0, 3, 1, 2)
+            horizon_outputs = []
+            for horizon_head in self.horizon_final_convs:
+                horizon_output = horizon_head(decoder_x)[:, :, :, -1]
+                horizon_output = horizon_output.permute(0, 2, 1).unsqueeze(1)
+                horizon_outputs.append(horizon_output)
+            output = torch.cat(horizon_outputs, dim=1)
         else:
             output = self.final_conv(x.permute(0, 3, 1, 2))[:, :, :, -1]
             batch_size, _, num_nodes = output.shape
