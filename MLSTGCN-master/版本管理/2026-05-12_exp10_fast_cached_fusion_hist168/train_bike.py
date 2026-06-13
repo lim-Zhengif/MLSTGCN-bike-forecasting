@@ -89,6 +89,16 @@ parser.add_argument(
     help="Use 'true' to freeze all parameters except the AST-TCN residual branch after loading --init_checkpoint.",
 )
 parser.add_argument(
+    '--freeze_trainable_scope',
+    choices=['ast_tcn', 'ast_tcn_final_head'],
+    default='ast_tcn',
+    help=(
+        "Trainable scope used with --freeze_non_ast_tcn true. "
+        "'ast_tcn' keeps only the AST-TCN residual branch trainable; "
+        "'ast_tcn_final_head' also keeps the final prediction head trainable."
+    ),
+)
+parser.add_argument(
     '--monitor_metric',
     choices=['val_mae_epoch', 'val_loss_epoch'],
     default='val_mae_epoch',
@@ -575,6 +585,7 @@ hyperparameter_defaults = dict(
         train_anchor_hours=args.train_anchor_hours,
         init_checkpoint=args.init_checkpoint,
         freeze_non_ast_tcn=args.freeze_non_ast_tcn,
+        freeze_trainable_scope=args.freeze_trainable_scope,
         mape_epsilon=args.mape_epsilon,
         weekday_embed_dim=args.weekday_embed_dim,
         anchor_homogeneous_batches=args.anchor_homogeneous_batches,
@@ -1201,6 +1212,17 @@ class LightningModel(LightningModule):
                 self.model.ast_tcn_branch.train()
             else:
                 self.model.ast_tcn_branch.eval()
+        if config['train'].get('freeze_trainable_scope') == 'ast_tcn_final_head':
+            if hasattr(self.model, 'final_conv'):
+                if self.training:
+                    self.model.final_conv.train()
+                else:
+                    self.model.final_conv.eval()
+            if hasattr(self.model, 'trend_decoder'):
+                if self.training:
+                    self.model.trend_decoder.train()
+                else:
+                    self.model.trend_decoder.eval()
 
     def _run_model(self, batch):
         self._sync_frozen_module_modes()
@@ -1281,11 +1303,18 @@ def main():
     lightning_model = LightningModel(scaler, fusiongraph, categorical_feature_configs)
 
     def freeze_non_ast_tcn_parameters(model):
+        trainable_scope = config['train'].get('freeze_trainable_scope', 'ast_tcn')
+        trainable_prefixes = ['model.ast_tcn_branch.']
+        if trainable_scope == 'ast_tcn_final_head':
+            trainable_prefixes.extend([
+                'model.final_conv.',
+                'model.trend_decoder.',
+            ])
         trainable_names = []
         frozen_count = 0
         trainable_count = 0
         for param_name, param in model.named_parameters():
-            keep_trainable = param_name.startswith('model.ast_tcn_branch.')
+            keep_trainable = any(param_name.startswith(prefix) for prefix in trainable_prefixes)
             param.requires_grad = keep_trainable
             if keep_trainable:
                 trainable_names.append(param_name)
@@ -1293,10 +1322,13 @@ def main():
             else:
                 frozen_count += param.numel()
         if not trainable_names:
-            raise RuntimeError('--freeze_non_ast_tcn found no AST-TCN residual branch parameters to train.')
+            raise RuntimeError(
+                '--freeze_non_ast_tcn found no parameters to train for scope %s.'
+                % trainable_scope
+            )
         print(
-            'Frozen non-AST-TCN parameters: frozen=%d trainable=%d trainable_tensors=%d'
-            % (frozen_count, trainable_count, len(trainable_names))
+            'Frozen non-AST-TCN parameters: scope=%s frozen=%d trainable=%d trainable_tensors=%d'
+            % (trainable_scope, frozen_count, trainable_count, len(trainable_names))
         )
         print('Trainable parameter prefixes include:', trainable_names[:10])
 
