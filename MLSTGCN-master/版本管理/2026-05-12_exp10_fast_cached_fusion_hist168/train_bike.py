@@ -84,6 +84,11 @@ parser.add_argument('--precision', default='32', help="Lightning precision mode,
 parser.add_argument('--grad_clip_val', type=float, default=0.0, help='Gradient clipping threshold. Set > 0 to stabilize harder runs.')
 parser.add_argument('--init_checkpoint', default=None, help='Optional checkpoint whose model weights are loaded before training starts.')
 parser.add_argument(
+    '--freeze_non_ast_tcn',
+    default='false',
+    help="Use 'true' to freeze all parameters except the AST-TCN residual branch after loading --init_checkpoint.",
+)
+parser.add_argument(
     '--monitor_metric',
     choices=['val_mae_epoch', 'val_loss_epoch'],
     default='val_mae_epoch',
@@ -330,6 +335,7 @@ args.graph_sparsify_keep_self = parse_bool_arg(args.graph_sparsify_keep_self, '-
 args.context_gate = parse_bool_arg(args.context_gate, '--context_gate')
 args.context_gate_anchor_hour = parse_bool_arg(args.context_gate_anchor_hour, '--context_gate_anchor_hour')
 args.anchor_homogeneous_batches = parse_bool_arg(args.anchor_homogeneous_batches, '--anchor_homogeneous_batches')
+args.freeze_non_ast_tcn = parse_bool_arg(args.freeze_non_ast_tcn, '--freeze_non_ast_tcn')
 args.trend_alignment_decoder = parse_bool_arg(args.trend_alignment_decoder, '--trend_alignment_decoder')
 args.ast_tcn_residual = parse_bool_arg(args.ast_tcn_residual, '--ast_tcn_residual')
 args.ast_tcn_bounded_alpha = parse_bool_arg(args.ast_tcn_bounded_alpha, '--ast_tcn_bounded_alpha')
@@ -400,6 +406,8 @@ if args.ast_tcn_bounded_alpha and not (0.0 <= args.ast_tcn_residual_init <= args
     parser.error('--ast_tcn_residual_init must be within [0, --ast_tcn_alpha_max] when --ast_tcn_bounded_alpha true.')
 if args.ast_tcn_residual_horizon_mask and len(args.ast_tcn_residual_horizon_mask) != args.pred_len:
     parser.error('--ast_tcn_residual_horizon_mask length must match --pred_len.')
+if args.freeze_non_ast_tcn and not args.ast_tcn_residual:
+    parser.error('--freeze_non_ast_tcn requires --ast_tcn_residual true.')
 if args.ast_tcn_residual_gate_hidden_dim <= 0:
     parser.error('--ast_tcn_residual_gate_hidden_dim must be > 0.')
 if not (0.0 < args.ast_tcn_residual_gate_init < 1.0):
@@ -566,6 +574,7 @@ hyperparameter_defaults = dict(
         peak_anchor_hours=args.peak_anchor_hours,
         train_anchor_hours=args.train_anchor_hours,
         init_checkpoint=args.init_checkpoint,
+        freeze_non_ast_tcn=args.freeze_non_ast_tcn,
         mape_epsilon=args.mape_epsilon,
         weekday_embed_dim=args.weekday_embed_dim,
         anchor_homogeneous_batches=args.anchor_homogeneous_batches,
@@ -1183,7 +1192,18 @@ class LightningModel(LightningModule):
         weighted = loss * sample_weight
         return weighted.mean() / sample_weight.mean().clamp(min=1e-6)
 
+    def _sync_frozen_module_modes(self):
+        if not config['train'].get('freeze_non_ast_tcn', False):
+            return
+        self.model.eval()
+        if hasattr(self.model, 'ast_tcn_branch'):
+            if self.training:
+                self.model.ast_tcn_branch.train()
+            else:
+                self.model.ast_tcn_branch.eval()
+
     def _run_model(self, batch):
+        self._sync_frozen_module_modes()
         if len(batch) == 3:
             x, y, anchor_hours = batch
         else:
@@ -1225,7 +1245,10 @@ class LightningModel(LightningModule):
         self.log_dict(self.metric_lightning.compute())
 
     def configure_optimizers(self):
-        optimizer = Adam(self.parameters(), lr=config['train']['lr'], weight_decay=config['train']['weight_decay'])
+        trainable_params = [param for param in self.parameters() if param.requires_grad]
+        if not trainable_params:
+            raise RuntimeError('No trainable parameters remain. Check freeze settings.')
+        optimizer = Adam(trainable_params, lr=config['train']['lr'], weight_decay=config['train']['weight_decay'])
         scheduler = ReduceLROnPlateau(
             optimizer,
             mode='min',
@@ -1256,6 +1279,27 @@ def main():
     )
     lightning_data = LightningData(train_set, val_set, test_set)
     lightning_model = LightningModel(scaler, fusiongraph, categorical_feature_configs)
+
+    def freeze_non_ast_tcn_parameters(model):
+        trainable_names = []
+        frozen_count = 0
+        trainable_count = 0
+        for param_name, param in model.named_parameters():
+            keep_trainable = param_name.startswith('model.ast_tcn_branch.')
+            param.requires_grad = keep_trainable
+            if keep_trainable:
+                trainable_names.append(param_name)
+                trainable_count += param.numel()
+            else:
+                frozen_count += param.numel()
+        if not trainable_names:
+            raise RuntimeError('--freeze_non_ast_tcn found no AST-TCN residual branch parameters to train.')
+        print(
+            'Frozen non-AST-TCN parameters: frozen=%d trainable=%d trainable_tensors=%d'
+            % (frozen_count, trainable_count, len(trainable_names))
+        )
+        print('Trainable parameter prefixes include:', trainable_names[:10])
+
     if config['train']['init_checkpoint']:
         checkpoint = torch.load(config['train']['init_checkpoint'], map_location=device)
         state_dict = checkpoint.get('state_dict', checkpoint)
@@ -1264,6 +1308,8 @@ def main():
             print('Loaded init checkpoint with missing keys:', missing)
             print('Loaded init checkpoint with unexpected keys:', unexpected)
         print('Loaded init checkpoint weights:', config['train']['init_checkpoint'])
+    if config['train']['freeze_non_ast_tcn']:
+        freeze_non_ast_tcn_parameters(lightning_model)
     checkpoint_filename = 'best-{epoch:02d}-' + args.monitor_metric + '={' + args.monitor_metric + ':.4f}'
     checkpoint_callback = ModelCheckpoint(
         monitor=args.monitor_metric,
