@@ -195,6 +195,16 @@ parser.add_argument(
     default='all',
     help='Apply context gate to all graphs, redistribute OD graphs, softly correct OD graphs around the exp10 fusion prior, or hard-select the matching anchor-hour OD graph.',
 )
+parser.add_argument('--horizon_graph_fusion_gate', default='false', help="Use 'true' to enable anchor-hour and horizon-aware graph fusion gates.")
+parser.add_argument('--horizon_graph_hidden_dim', type=int, default=32)
+parser.add_argument('--horizon_graph_anchor_embed_dim', type=int, default=8)
+parser.add_argument('--horizon_graph_horizon_embed_dim', type=int, default=4)
+parser.add_argument(
+    '--horizon_graph_gate_residual',
+    type=float,
+    default=0.8,
+    help='Residual strength around the exp10 graph stack. 1.0 keeps exp10 graph fusion; 0.0 uses pure anchor-horizon gate.',
+)
 parser.add_argument(
     '--anchor_homogeneous_batches',
     default='false',
@@ -233,6 +243,17 @@ parser.add_argument(
     '--horizon_specific_prediction_head',
     default='false',
     help="Use 'true' to replace the shared final prediction head with one output head per horizon.",
+)
+parser.add_argument(
+    '--horizon_graph_fusion_decoder',
+    default='false',
+    help="Use 'true' to decode each horizon from an anchor-horizon gated fusion graph.",
+)
+parser.add_argument(
+    '--horizon_graph_decoder_residual',
+    type=float,
+    default=0.2,
+    help='Feature blend strength for horizon graph decoder. 0 keeps the exp10 hidden state; 1 uses only graph-propagated hidden state.',
 )
 parser.add_argument('--ast_tcn_residual', default='false', help="Use 'true' or 'false' to add an AST-TCN-inspired residual branch to MSTGCN.")
 parser.add_argument('--ast_tcn_hidden_dim', type=int, default=32)
@@ -349,12 +370,17 @@ args.graph_sparsify_symmetric = parse_bool_arg(args.graph_sparsify_symmetric, '-
 args.graph_sparsify_keep_self = parse_bool_arg(args.graph_sparsify_keep_self, '--graph_sparsify_keep_self')
 args.context_gate = parse_bool_arg(args.context_gate, '--context_gate')
 args.context_gate_anchor_hour = parse_bool_arg(args.context_gate_anchor_hour, '--context_gate_anchor_hour')
+args.horizon_graph_fusion_gate = parse_bool_arg(args.horizon_graph_fusion_gate, '--horizon_graph_fusion_gate')
 args.anchor_homogeneous_batches = parse_bool_arg(args.anchor_homogeneous_batches, '--anchor_homogeneous_batches')
 args.freeze_non_ast_tcn = parse_bool_arg(args.freeze_non_ast_tcn, '--freeze_non_ast_tcn')
 args.trend_alignment_decoder = parse_bool_arg(args.trend_alignment_decoder, '--trend_alignment_decoder')
 args.horizon_specific_prediction_head = parse_bool_arg(
     args.horizon_specific_prediction_head,
     '--horizon_specific_prediction_head',
+)
+args.horizon_graph_fusion_decoder = parse_bool_arg(
+    args.horizon_graph_fusion_decoder,
+    '--horizon_graph_fusion_decoder',
 )
 args.ast_tcn_residual = parse_bool_arg(args.ast_tcn_residual, '--ast_tcn_residual')
 args.ast_tcn_bounded_alpha = parse_bool_arg(args.ast_tcn_bounded_alpha, '--ast_tcn_bounded_alpha')
@@ -393,6 +419,16 @@ if args.context_gate_anchor_hour and not args.context_gate:
     parser.error('--context_gate_anchor_hour requires --context_gate true.')
 if args.context_gate_anchor_od_prior < 0:
     parser.error('--context_gate_anchor_od_prior must be >= 0.')
+if args.horizon_graph_hidden_dim <= 0:
+    parser.error('--horizon_graph_hidden_dim must be > 0.')
+if args.horizon_graph_anchor_embed_dim <= 0:
+    parser.error('--horizon_graph_anchor_embed_dim must be > 0.')
+if args.horizon_graph_horizon_embed_dim <= 0:
+    parser.error('--horizon_graph_horizon_embed_dim must be > 0.')
+if not (0.0 <= args.horizon_graph_gate_residual <= 1.0):
+    parser.error('--horizon_graph_gate_residual must be within [0, 1].')
+if args.horizon_graph_fusion_decoder and not args.horizon_graph_fusion_gate:
+    parser.error('--horizon_graph_fusion_decoder requires --horizon_graph_fusion_gate true.')
 if args.context_gate_scope == 'hard_anchor_od' and not args.context_gate:
     parser.error('--context_gate_scope hard_anchor_od requires --context_gate true.')
 if args.context_gate_scope == 'hard_anchor_od' and not args.context_gate_anchor_hour:
@@ -409,6 +445,12 @@ if args.trend_attention_heads <= 0:
     parser.error('--trend_attention_heads must be > 0.')
 if args.trend_alignment_decoder and args.horizon_specific_prediction_head:
     parser.error('--horizon_specific_prediction_head is only supported with the standard final prediction head, not --trend_alignment_decoder.')
+if args.trend_alignment_decoder and args.horizon_graph_fusion_decoder:
+    parser.error('--horizon_graph_fusion_decoder is only supported with the standard final prediction head, not --trend_alignment_decoder.')
+if args.horizon_specific_prediction_head and args.horizon_graph_fusion_decoder:
+    parser.error('--horizon_graph_fusion_decoder uses the shared final head and cannot be combined with --horizon_specific_prediction_head.')
+if not (0.0 <= args.horizon_graph_decoder_residual <= 1.0):
+    parser.error('--horizon_graph_decoder_residual must be within [0, 1].')
 if args.ast_tcn_hidden_dim <= 0:
     parser.error('--ast_tcn_hidden_dim must be > 0.')
 if args.ast_tcn_layers <= 0:
@@ -518,6 +560,11 @@ hyperparameter_defaults = dict(
         context_gate_anchor_embed_dim=args.context_gate_anchor_embed_dim,
         context_gate_anchor_od_prior=args.context_gate_anchor_od_prior,
         context_gate_scope=args.context_gate_scope,
+        horizon_graph_fusion_gate=args.horizon_graph_fusion_gate,
+        horizon_graph_hidden_dim=args.horizon_graph_hidden_dim,
+        horizon_graph_anchor_embed_dim=args.horizon_graph_anchor_embed_dim,
+        horizon_graph_horizon_embed_dim=args.horizon_graph_horizon_embed_dim,
+        horizon_graph_gate_residual=args.horizon_graph_gate_residual,
         hgaurban_graph_prior_path=args.hgaurban_graph_prior_path,
         distri_type=args.graph_distri_type,
         func_type=args.graph_func_type,
@@ -543,6 +590,8 @@ hyperparameter_defaults = dict(
         trend_attention_heads=args.trend_attention_heads,
         trend_dropout=args.trend_dropout,
         horizon_specific_prediction_head=args.horizon_specific_prediction_head,
+        horizon_graph_fusion_decoder=args.horizon_graph_fusion_decoder,
+        horizon_graph_decoder_residual=args.horizon_graph_decoder_residual,
         ast_tcn_residual=args.ast_tcn_residual,
         ast_tcn_hidden_dim=args.ast_tcn_hidden_dim,
         ast_tcn_layers=args.ast_tcn_layers,
@@ -810,6 +859,7 @@ graph = BikeGraph(args.graph_dir, config['graph'], device)
 return_anchor = bool(
     config['train']['peak_anchor_loss_weight'] != 1.0
     or config['graph']['context_gate_anchor_hour']
+    or config['graph']['horizon_graph_fusion_gate']
     or config['train']['anchor_homogeneous_batches']
 )
 train_set = Bike(args.data_dir, 'train', return_anchor=return_anchor)
@@ -1096,6 +1146,8 @@ class LightningModel(LightningModule):
                 trend_attention_heads=config['model']['trend_attention_heads'],
                 trend_dropout=config['model']['trend_dropout'],
                 horizon_specific_prediction_head=config['model']['horizon_specific_prediction_head'],
+                horizon_graph_fusion_decoder=config['model']['horizon_graph_fusion_decoder'],
+                horizon_graph_decoder_residual=config['model']['horizon_graph_decoder_residual'],
                 ast_tcn_residual=config['model']['ast_tcn_residual'],
                 ast_tcn_hidden_dim=config['model']['ast_tcn_hidden_dim'],
                 ast_tcn_layers=config['model']['ast_tcn_layers'],

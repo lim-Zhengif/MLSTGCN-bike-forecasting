@@ -309,6 +309,12 @@ class FusionGraphModel(nn.Module):
         self.context_gate_anchor_embed_dim = int(conf_graph.get('context_gate_anchor_embed_dim', 8))
         self.context_gate_anchor_od_prior = float(conf_graph.get('context_gate_anchor_od_prior', 0.0))
         self.context_gate_scope = str(conf_graph.get('context_gate_scope', 'all')).lower()
+        self.horizon_graph_fusion_gate = bool(conf_graph.get('horizon_graph_fusion_gate', False))
+        self.horizon_graph_hidden_dim = int(conf_graph.get('horizon_graph_hidden_dim', 32))
+        self.horizon_graph_anchor_embed_dim = int(conf_graph.get('horizon_graph_anchor_embed_dim', 8))
+        self.horizon_graph_horizon_embed_dim = int(conf_graph.get('horizon_graph_horizon_embed_dim', 4))
+        self.horizon_graph_gate_residual = float(conf_graph.get('horizon_graph_gate_residual', 0.8))
+        self.num_for_predict = int(conf_data.get('pred_len', 1))
         self.task = conf_data['type']
         self.se_path = self._resolve_se_path()
 
@@ -355,6 +361,17 @@ class FusionGraphModel(nn.Module):
                         nn.ReLU(),
                         nn.Linear(self.context_gate_hidden_dim, self.context_gate_output_dim),
                     )
+            if self.horizon_graph_fusion_gate:
+                self.horizon_anchor_embedding = nn.Embedding(24, self.horizon_graph_anchor_embed_dim)
+                self.horizon_step_embedding = nn.Embedding(self.num_for_predict, self.horizon_graph_horizon_embed_dim)
+                nn.init.xavier_uniform_(self.horizon_anchor_embedding.weight)
+                nn.init.xavier_uniform_(self.horizon_step_embedding.weight)
+                horizon_gate_input_dim = self.horizon_graph_anchor_embed_dim + self.horizon_graph_horizon_embed_dim
+                self.horizon_graph_gate_encoder = nn.Sequential(
+                    nn.Linear(horizon_gate_input_dim, self.horizon_graph_hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(self.horizon_graph_hidden_dim, self.graph.graph_num),
+                )
 
         self.register_buffer('SE', self._load_spatial_embedding())
 
@@ -542,9 +559,54 @@ class FusionGraphModel(nn.Module):
         self.context_gate_multipliers_for_run = context_weights
         return context_weights
 
+    def _anchor_hour_for_batch(self, x=None, anchor_hours=None):
+        anchor_hour_ids = self._extract_anchor_hour_ids(x, anchor_hours=anchor_hours)
+        if anchor_hour_ids is None:
+            return torch.zeros((), dtype=torch.long, device=self.device)
+        return torch.round(anchor_hour_ids.float().mean()).clamp(0, 23).long()
+
+    def horizon_graphs_for_run(self, x=None, anchor_hours=None, num_for_predict=None):
+        if not self.horizon_graph_fusion_gate:
+            return None
+        if not self.fusion_graph:
+            horizon_count = int(num_for_predict or self.num_for_predict)
+            return self.A_single.unsqueeze(0).repeat(horizon_count, 1, 1)
+        if not hasattr(self, 'graph_stack_for_run'):
+            self.forward(x=x, anchor_hours=anchor_hours)
+
+        horizon_count = int(num_for_predict or self.num_for_predict)
+        graph_stack = self.graph_stack_for_run
+        anchor_hour = self._anchor_hour_for_batch(x=x, anchor_hours=anchor_hours).to(graph_stack.device)
+        anchor_embedding = self.horizon_anchor_embedding(anchor_hour.view(1)).expand(horizon_count, -1)
+        horizon_ids = torch.arange(horizon_count, device=graph_stack.device, dtype=torch.long)
+        horizon_embedding = self.horizon_step_embedding(horizon_ids)
+        gate_input = torch.cat([anchor_embedding, horizon_embedding], dim=-1)
+        gate_logits = self.horizon_graph_gate_encoder(gate_input)
+        gate_weights = torch.softmax(gate_logits, dim=-1)
+
+        graph_count = float(self.graph.graph_num)
+        multipliers = gate_weights * graph_count
+        if self.horizon_graph_gate_residual > 0:
+            multipliers = (
+                self.horizon_graph_gate_residual * torch.ones_like(multipliers)
+                + (1.0 - self.horizon_graph_gate_residual) * multipliers
+            )
+
+        horizon_graphs = torch.einsum('hg,gij->hij', multipliers, graph_stack)
+        horizon_graphs = F.relu(horizon_graphs)
+        horizon_graphs = torch.stack([
+            self._apply_graph_sparsification(horizon_graphs[h])
+            for h in range(horizon_graphs.shape[0])
+        ], dim=0)
+        self.horizon_graph_gate_weights_for_run = gate_weights
+        self.horizon_graph_gate_multipliers_for_run = multipliers
+        self.horizon_graphs_for_last_run = horizon_graphs
+        return horizon_graphs
+
     def forward(self, x=None, anchor_hours=None):
 
         if self.graph.fix_weight:
+            self.graph_stack_for_run = self.graph.get_fix_weight().unsqueeze(0)
             return self.graph.get_fix_weight()
 
         if self.fusion_graph:
@@ -554,8 +616,10 @@ class FusionGraphModel(nn.Module):
                 if context_weights is not None:
                     self.A_w = self.A_w * context_weights
                     self.A_w = self.A_w / self.A_w.sum().clamp(min=1e-6)
-                adj_list = [self.used_graphs[i] * self.A_w[i] for i in range(self.graph.graph_num)]
-                self.adj_for_run = torch.sum(torch.stack(adj_list), dim=0)      
+                self.graph_stack_for_run = torch.stack([
+                    self.used_graphs[i] * self.A_w[i] for i in range(self.graph.graph_num)
+                ], dim=0)
+                self.adj_for_run = torch.sum(self.graph_stack_for_run, dim=0)      
                 # create a graph stack
 
             else:
@@ -573,13 +637,15 @@ class FusionGraphModel(nn.Module):
                     graph_stack = self.adj_w * W.permute(1, 0, 2)
                     if context_weights is not None:
                         graph_stack = graph_stack * context_weights.view(-1, 1, 1)
-                    W = torch.sum(graph_stack, dim=0)
+                    self.graph_stack_for_run = graph_stack
+                    W = torch.sum(self.graph_stack_for_run, dim=0)
 
                 else:
                     graph_stack = self.adj_w * torch.stack(self.used_graphs)
                     if context_weights is not None:
                         graph_stack = graph_stack * context_weights.view(-1, 1, 1)
-                    W= torch.sum(graph_stack, dim=0)
+                    self.graph_stack_for_run = graph_stack
+                    W= torch.sum(self.graph_stack_for_run, dim=0)
                 act = nn.ReLU()
                 W = act(W)
                 W = self._apply_graph_sparsification(W)
@@ -587,5 +653,6 @@ class FusionGraphModel(nn.Module):
 
         else:
             self.adj_for_run = self.A_single
+            self.graph_stack_for_run = self.A_single.unsqueeze(0)
 
         return self.adj_for_run

@@ -649,6 +649,8 @@ class MSTGCN_submodule(nn.Module):
         trend_attention_heads=4,
         trend_dropout=0.1,
         horizon_specific_prediction_head=False,
+        horizon_graph_fusion_decoder=False,
+        horizon_graph_decoder_residual=0.2,
         ast_tcn_residual=False,
         ast_tcn_hidden_dim=32,
         ast_tcn_layers=4,
@@ -801,6 +803,8 @@ class MSTGCN_submodule(nn.Module):
         self.DEVICE = DEVICE
         self.num_for_predict = num_for_predict
         self.out_dim = out_dim
+        self.use_horizon_graph_fusion_decoder = bool(horizon_graph_fusion_decoder)
+        self.horizon_graph_decoder_residual = float(horizon_graph_decoder_residual)
         self.to(self.DEVICE)
 
     def forward(self, x, anchor_hours=None):
@@ -823,6 +827,29 @@ class MSTGCN_submodule(nn.Module):
 
         if self.use_trend_alignment_decoder:
             output = self.trend_decoder(x, context_x)
+        elif self.use_horizon_graph_fusion_decoder:
+            horizon_graphs = self.fusiongraph.horizon_graphs_for_run(
+                context_x,
+                anchor_hours=anchor_hours,
+                num_for_predict=self.num_for_predict,
+            )
+            if horizon_graphs is None:
+                raise RuntimeError('horizon_graph_fusion_decoder requires FusionGraphModel.horizon_graph_fusion_gate.')
+            horizon_outputs = []
+            for horizon_idx in range(self.num_for_predict):
+                adj_h = horizon_graphs[horizon_idx].to(x.device, dtype=x.dtype)
+                adj_h = adj_h / adj_h.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+                graph_x = torch.einsum('ij,bjft->bift', adj_h, x)
+                decoder_x = (
+                    (1.0 - self.horizon_graph_decoder_residual) * x
+                    + self.horizon_graph_decoder_residual * graph_x
+                )
+                horizon_all = self.final_conv(decoder_x.permute(0, 3, 1, 2))[:, :, :, -1]
+                batch_size, _, num_nodes = horizon_all.shape
+                horizon_all = horizon_all.view(batch_size, self.num_for_predict, self.out_dim, num_nodes)
+                horizon_output = horizon_all[:, horizon_idx].permute(0, 2, 1).unsqueeze(1)
+                horizon_outputs.append(horizon_output)
+            output = torch.cat(horizon_outputs, dim=1)
         elif self.use_horizon_specific_prediction_head:
             decoder_x = x.permute(0, 3, 1, 2)
             horizon_outputs = []
