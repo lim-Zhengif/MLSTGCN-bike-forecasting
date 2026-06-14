@@ -435,8 +435,11 @@ if args.context_gate_scope == 'hard_anchor_od' and not args.context_gate_anchor_
     parser.error('--context_gate_scope hard_anchor_od requires --context_gate_anchor_hour true.')
 if args.context_gate_scope == 'hard_anchor_od' and not args.anchor_homogeneous_batches:
     parser.error('--context_gate_scope hard_anchor_od requires --anchor_homogeneous_batches true for batch-level Cheb graphs.')
-if args.anchor_homogeneous_batches and not args.context_gate_anchor_hour:
-    parser.error('--anchor_homogeneous_batches is intended for --context_gate_anchor_hour true.')
+if args.anchor_homogeneous_batches and not (
+    args.context_gate_anchor_hour
+    or args.horizon_graph_fusion_gate
+):
+    parser.error('--anchor_homogeneous_batches is intended for --context_gate_anchor_hour true or --horizon_graph_fusion_gate true.')
 if args.trend_time_cycle <= 0:
     parser.error('--trend_time_cycle must be > 0.')
 if args.trend_time_embed_dim <= 0:
