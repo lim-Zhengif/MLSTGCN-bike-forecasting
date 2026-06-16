@@ -159,6 +159,11 @@ parser.add_argument(
     default='',
     help='Optional path to hgaurban_graph_prior.npy. Required when --graph_use includes hgaurban unless the file is in graph_dir.',
 )
+parser.add_argument(
+    '--cssg_rw_graph_prior_path',
+    default='',
+    help='Optional path to cssg_rw_graph_prior.npy. Required when --graph_use includes cssg_rw unless the file is in graph_dir.',
+)
 parser.add_argument('--graph_attention', default='true', help="Use 'true' or 'false' to enable fusion-graph attention.")
 parser.add_argument('--matrix_weight', default='true', help="Use 'true' or 'false' to enable trainable graph-specific matrices.")
 parser.add_argument('--graph_fix_weight', default='false', help="Use 'true' or 'false' to freeze graph weights from prebuilt graphs.")
@@ -325,6 +330,7 @@ def parse_graph_use_arg(value):
         'od20',
         'od21',
         'hgaurban',
+        'cssg_rw',
     }
     unknown_graphs = [item for item in graph_use if item not in allowed_graphs]
     if unknown_graphs:
@@ -569,6 +575,7 @@ hyperparameter_defaults = dict(
         horizon_graph_horizon_embed_dim=args.horizon_graph_horizon_embed_dim,
         horizon_graph_gate_residual=args.horizon_graph_gate_residual,
         hgaurban_graph_prior_path=args.hgaurban_graph_prior_path,
+        cssg_rw_graph_prior_path=args.cssg_rw_graph_prior_path,
         distri_type=args.graph_distri_type,
         func_type=args.graph_func_type,
         attention=args.graph_attention,
@@ -843,6 +850,11 @@ if args.hgaurban_graph_prior_path:
     if not os.path.exists(args.hgaurban_graph_prior_path):
         parser.error('--hgaurban_graph_prior_path does not exist: %s' % args.hgaurban_graph_prior_path)
     config['graph']['hgaurban_graph_prior_path'] = args.hgaurban_graph_prior_path
+if args.cssg_rw_graph_prior_path:
+    args.cssg_rw_graph_prior_path = resolve_project_path(PROJECT_ROOT, args.cssg_rw_graph_prior_path)
+    if not os.path.exists(args.cssg_rw_graph_prior_path):
+        parser.error('--cssg_rw_graph_prior_path does not exist: %s' % args.cssg_rw_graph_prior_path)
+    config['graph']['cssg_rw_graph_prior_path'] = args.cssg_rw_graph_prior_path
 if args.init_checkpoint:
     args.init_checkpoint = resolve_project_path(PROJECT_ROOT, args.init_checkpoint)
     if not os.path.exists(args.init_checkpoint):

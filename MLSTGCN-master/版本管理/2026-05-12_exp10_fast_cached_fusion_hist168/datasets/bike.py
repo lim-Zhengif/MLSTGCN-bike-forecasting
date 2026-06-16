@@ -39,6 +39,7 @@ class BikeGraph:
         fix_weight = config_graph['fix_weight']
         tempp_diag_zero = config_graph['tempp_diag_zero']
         hgaurban_graph_prior_path = config_graph.get('hgaurban_graph_prior_path') or ''
+        cssg_rw_graph_prior_path = config_graph.get('cssg_rw_graph_prior_path') or ''
 
         self.A_dist = torch.from_numpy(
             np.float32(np.load(os.path.join(graph_dir, 'dist.npy')))
@@ -82,6 +83,26 @@ class BikeGraph:
                 )
             self.extra_graphs['hgaurban'] = torch.from_numpy(
                 np.float32(np.load(hgaurban_graph_prior_path))
+            ).to(self.device)
+        if 'cssg_rw' in use_graph:
+            if not cssg_rw_graph_prior_path:
+                cssg_rw_graph_prior_path = os.path.join(graph_dir, 'cssg_rw_graph_prior.npy')
+            if not os.path.isabs(cssg_rw_graph_prior_path):
+                candidate_paths = [
+                    os.path.join(graph_dir, cssg_rw_graph_prior_path),
+                    os.path.join(PROJECT_ROOT, cssg_rw_graph_prior_path),
+                    os.path.join(PROJ_DIR, cssg_rw_graph_prior_path),
+                ]
+                cssg_rw_graph_prior_path = next(
+                    (path for path in candidate_paths if os.path.exists(path)),
+                    candidate_paths[0],
+                )
+            if not os.path.exists(cssg_rw_graph_prior_path):
+                raise FileNotFoundError(
+                    'Missing CSSG RW graph prior for graph_use=cssg_rw: %s' % cssg_rw_graph_prior_path
+                )
+            self.extra_graphs['cssg_rw'] = torch.from_numpy(
+                np.float32(np.load(cssg_rw_graph_prior_path))
             ).to(self.device)
 
         self.node_num = self.A_dist.shape[0]
