@@ -210,6 +210,18 @@ parser.add_argument(
     default=0.8,
     help='Residual strength around the exp10 graph stack. 1.0 keeps exp10 graph fusion; 0.0 uses pure anchor-horizon gate.',
 )
+parser.add_argument('--state_graph_correction', default='false', help="Use 'true' to add a lightweight state-conditioned Top-k graph correction after graph fusion.")
+parser.add_argument(
+    '--state_graph_lambda',
+    type=float,
+    default=0.3,
+    help='Blend weight for state-conditioned graph correction: A_final=(1-lambda)A_prior+lambda*A_state.',
+)
+parser.add_argument('--state_graph_topk', type=int, default=20)
+parser.add_argument('--state_graph_embed_dim', type=int, default=16)
+parser.add_argument('--state_graph_hidden_dim', type=int, default=32)
+parser.add_argument('--state_graph_symmetric', default='false', help="Use 'true' to symmetrize the state-conditioned Top-k graph.")
+parser.add_argument('--state_graph_keep_self', default='true', help="Use 'true' to keep self loops in the state-conditioned graph.")
 parser.add_argument(
     '--anchor_homogeneous_batches',
     default='false',
@@ -377,6 +389,9 @@ args.graph_sparsify_keep_self = parse_bool_arg(args.graph_sparsify_keep_self, '-
 args.context_gate = parse_bool_arg(args.context_gate, '--context_gate')
 args.context_gate_anchor_hour = parse_bool_arg(args.context_gate_anchor_hour, '--context_gate_anchor_hour')
 args.horizon_graph_fusion_gate = parse_bool_arg(args.horizon_graph_fusion_gate, '--horizon_graph_fusion_gate')
+args.state_graph_correction = parse_bool_arg(args.state_graph_correction, '--state_graph_correction')
+args.state_graph_symmetric = parse_bool_arg(args.state_graph_symmetric, '--state_graph_symmetric')
+args.state_graph_keep_self = parse_bool_arg(args.state_graph_keep_self, '--state_graph_keep_self')
 args.anchor_homogeneous_batches = parse_bool_arg(args.anchor_homogeneous_batches, '--anchor_homogeneous_batches')
 args.freeze_non_ast_tcn = parse_bool_arg(args.freeze_non_ast_tcn, '--freeze_non_ast_tcn')
 args.trend_alignment_decoder = parse_bool_arg(args.trend_alignment_decoder, '--trend_alignment_decoder')
@@ -435,6 +450,14 @@ if not (0.0 <= args.horizon_graph_gate_residual <= 1.0):
     parser.error('--horizon_graph_gate_residual must be within [0, 1].')
 if args.horizon_graph_fusion_decoder and not args.horizon_graph_fusion_gate:
     parser.error('--horizon_graph_fusion_decoder requires --horizon_graph_fusion_gate true.')
+if not (0.0 <= args.state_graph_lambda <= 1.0):
+    parser.error('--state_graph_lambda must be within [0, 1].')
+if args.state_graph_topk < 0:
+    parser.error('--state_graph_topk must be >= 0.')
+if args.state_graph_embed_dim <= 0:
+    parser.error('--state_graph_embed_dim must be > 0.')
+if args.state_graph_hidden_dim <= 0:
+    parser.error('--state_graph_hidden_dim must be > 0.')
 if args.context_gate_scope == 'hard_anchor_od' and not args.context_gate:
     parser.error('--context_gate_scope hard_anchor_od requires --context_gate true.')
 if args.context_gate_scope == 'hard_anchor_od' and not args.context_gate_anchor_hour:
@@ -574,6 +597,13 @@ hyperparameter_defaults = dict(
         horizon_graph_anchor_embed_dim=args.horizon_graph_anchor_embed_dim,
         horizon_graph_horizon_embed_dim=args.horizon_graph_horizon_embed_dim,
         horizon_graph_gate_residual=args.horizon_graph_gate_residual,
+        state_graph_correction=args.state_graph_correction,
+        state_graph_lambda=args.state_graph_lambda,
+        state_graph_topk=args.state_graph_topk,
+        state_graph_embed_dim=args.state_graph_embed_dim,
+        state_graph_hidden_dim=args.state_graph_hidden_dim,
+        state_graph_symmetric=args.state_graph_symmetric,
+        state_graph_keep_self=args.state_graph_keep_self,
         hgaurban_graph_prior_path=args.hgaurban_graph_prior_path,
         cssg_rw_graph_prior_path=args.cssg_rw_graph_prior_path,
         distri_type=args.graph_distri_type,

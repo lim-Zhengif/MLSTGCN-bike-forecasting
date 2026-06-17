@@ -314,9 +314,26 @@ class FusionGraphModel(nn.Module):
         self.horizon_graph_anchor_embed_dim = int(conf_graph.get('horizon_graph_anchor_embed_dim', 8))
         self.horizon_graph_horizon_embed_dim = int(conf_graph.get('horizon_graph_horizon_embed_dim', 4))
         self.horizon_graph_gate_residual = float(conf_graph.get('horizon_graph_gate_residual', 0.8))
+        self.state_graph_correction = bool(conf_graph.get('state_graph_correction', False))
+        self.state_graph_lambda = float(conf_graph.get('state_graph_lambda', 0.3))
+        self.state_graph_topk = int(conf_graph.get('state_graph_topk', 20))
+        self.state_graph_embed_dim = int(conf_graph.get('state_graph_embed_dim', 16))
+        self.state_graph_hidden_dim = int(conf_graph.get('state_graph_hidden_dim', 32))
+        self.state_graph_symmetric = bool(conf_graph.get('state_graph_symmetric', False))
+        self.state_graph_keep_self = bool(conf_graph.get('state_graph_keep_self', True))
         self.num_for_predict = int(conf_data.get('pred_len', 1))
         self.task = conf_data['type']
         self.se_path = self._resolve_se_path()
+        if self.state_graph_correction:
+            node_num = int(self.graph.node_num)
+            in_dim = int(conf_data['in_dim'])
+            self.state_node_emb_left = nn.Parameter(torch.randn(node_num, self.state_graph_embed_dim))
+            self.state_node_emb_right = nn.Parameter(torch.randn(node_num, self.state_graph_embed_dim))
+            self.state_encoder = nn.Sequential(
+                nn.Linear(in_dim * 2, self.state_graph_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(self.state_graph_hidden_dim, self.state_graph_embed_dim),
+            )
 
         if self.graph.graph_num == 1:
             self.fusion_graph = False
@@ -431,6 +448,80 @@ class FusionGraphModel(nn.Module):
             sparsified = torch.maximum(sparsified, sparsified.T)
 
         return sparsified
+
+    def _row_normalize_graph(self, adj_matrix):
+        return adj_matrix / adj_matrix.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+
+    def _node_state_summary(self, x):
+        if x is None:
+            return None
+        if x.dim() != 4:
+            raise ValueError('state_graph_correction expects a 4D history tensor.')
+
+        node_num = int(self.graph.node_num)
+        if x.shape[1] == node_num:
+            # Current MSTGCN path passes x as (B, N, F, T).
+            state_mean = x.mean(dim=(0, 3))
+            state_last = x[:, :, :, -1].mean(dim=0)
+        elif x.shape[2] == node_num:
+            # Be permissive for callers that keep dataloader layout (B, T, N, F).
+            state_mean = x.mean(dim=(0, 1))
+            state_last = x[:, -1, :, :].mean(dim=0)
+        else:
+            raise ValueError(
+                'state_graph_correction cannot find node dimension in tensor shape %s for node_num=%s.'
+                % (tuple(x.shape), node_num)
+            )
+        return torch.cat([state_mean, state_last], dim=-1)
+
+    def _state_topk_dynamic_graph(self, x):
+        if (not self.state_graph_correction) or x is None:
+            return None
+
+        node_state = self._node_state_summary(x).to(
+            device=self.state_node_emb_left.device,
+            dtype=self.state_node_emb_left.dtype,
+        )
+        state_embedding = self.state_encoder(node_state)
+        left = self.state_node_emb_left + state_embedding
+        right = self.state_node_emb_right + state_embedding
+        scores = torch.sigmoid(torch.matmul(left, right.T) / math.sqrt(float(self.state_graph_embed_dim)))
+
+        num_nodes = scores.shape[0]
+        eye_mask = torch.eye(num_nodes, device=scores.device, dtype=torch.bool)
+        offdiag_scores = scores.masked_fill(eye_mask, float('-inf'))
+        keep_mask = torch.zeros_like(scores, dtype=torch.bool)
+
+        if self.state_graph_topk > 0:
+            topk = min(self.state_graph_topk, max(num_nodes - 1, 1))
+            _, topk_indices = torch.topk(offdiag_scores, k=topk, dim=-1)
+            row_indices = torch.arange(num_nodes, device=scores.device).unsqueeze(-1).expand_as(topk_indices)
+            keep_mask[row_indices, topk_indices] = True
+
+        if self.state_graph_keep_self:
+            keep_mask = keep_mask | eye_mask
+            scores = scores.masked_fill(eye_mask, 1.0)
+        else:
+            scores = scores.masked_fill(eye_mask, 0.0)
+
+        state_graph = scores * keep_mask.float()
+        if self.state_graph_symmetric:
+            state_graph = torch.maximum(state_graph, state_graph.T)
+        return self._row_normalize_graph(F.relu(state_graph))
+
+    def _apply_state_graph_correction(self, prior_graph, x):
+        self.adj_prior_for_run = prior_graph
+        self.state_graph_for_run = None
+        if (not self.state_graph_correction) or x is None:
+            return prior_graph
+
+        state_graph = self._state_topk_dynamic_graph(x).to(device=prior_graph.device, dtype=prior_graph.dtype)
+        prior_graph = self._row_normalize_graph(F.relu(prior_graph))
+        state_lambda = float(self.state_graph_lambda)
+        final_graph = (1.0 - state_lambda) * prior_graph + state_lambda * state_graph
+        self.state_graph_for_run = state_graph
+        self.state_graph_lambda_for_run = state_lambda
+        return self._row_normalize_graph(F.relu(final_graph))
 
     def _anchor_od_prior_logits(self, anchor_hour_ids):
         if self.context_gate_anchor_od_prior <= 0:
@@ -598,6 +689,17 @@ class FusionGraphModel(nn.Module):
             self._apply_graph_sparsification(horizon_graphs[h])
             for h in range(horizon_graphs.shape[0])
         ], dim=0)
+        if self.state_graph_correction and x is not None:
+            state_graph = self._state_topk_dynamic_graph(x).to(device=horizon_graphs.device, dtype=horizon_graphs.dtype)
+            horizon_graphs = torch.stack([
+                self._row_normalize_graph(
+                    F.relu(
+                        (1.0 - self.state_graph_lambda) * self._row_normalize_graph(F.relu(horizon_graphs[h]))
+                        + self.state_graph_lambda * state_graph
+                    )
+                )
+                for h in range(horizon_graphs.shape[0])
+            ], dim=0)
         self.horizon_graph_gate_weights_for_run = gate_weights
         self.horizon_graph_gate_multipliers_for_run = multipliers
         self.horizon_graphs_for_last_run = horizon_graphs
@@ -607,7 +709,9 @@ class FusionGraphModel(nn.Module):
 
         if self.graph.fix_weight:
             self.graph_stack_for_run = self.graph.get_fix_weight().unsqueeze(0)
-            return self.graph.get_fix_weight()
+            self.adj_for_run = self.graph.get_fix_weight()
+            self.adj_for_run = self._apply_state_graph_correction(self.adj_for_run, x)
+            return self.adj_for_run
 
         if self.fusion_graph:
             context_weights = self._context_gate_weights(x, anchor_hours=anchor_hours)
@@ -655,4 +759,5 @@ class FusionGraphModel(nn.Module):
             self.adj_for_run = self.A_single
             self.graph_stack_for_run = self.A_single.unsqueeze(0)
 
+        self.adj_for_run = self._apply_state_graph_correction(self.adj_for_run, x)
         return self.adj_for_run
