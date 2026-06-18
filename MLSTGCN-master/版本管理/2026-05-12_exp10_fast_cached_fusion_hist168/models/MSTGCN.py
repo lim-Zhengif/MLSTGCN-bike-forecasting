@@ -509,6 +509,105 @@ class ASTTCNResidualBranch(nn.Module):
         return self.residual_scale_for_output() * residual
 
 
+class STHybridMultiScaleResidualBranch(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        hidden_dim,
+        num_for_predict,
+        out_dim,
+        dilations=(1, 2, 4, 8),
+        kernel_size=3,
+        heads=4,
+        dropout=0.1,
+        residual_init=0.05,
+        bounded_alpha=False,
+        alpha_max=0.1,
+        zero_init=False,
+        edge_bias=False,
+        edge_bias_init=0.1,
+        edge_bias_eps=1e-6,
+    ):
+        super(STHybridMultiScaleResidualBranch, self).__init__()
+        self.num_for_predict = int(num_for_predict)
+        self.out_dim = int(out_dim)
+        self.bounded_alpha = bool(bounded_alpha)
+        self.alpha_max = float(alpha_max)
+        dilation_values = [int(item) for item in dilations]
+        if not dilation_values:
+            raise ValueError("ST-Hybrid multi-scale residual requires at least one dilation.")
+        self.input_proj = nn.Linear(int(in_channels), int(hidden_dim))
+        self.scale_blocks = nn.ModuleList([
+            CausalGatedTemporalBlock(
+                hidden_dim=int(hidden_dim),
+                kernel_size=int(kernel_size),
+                dilation=dilation,
+                dropout=float(dropout),
+            )
+            for dilation in dilation_values
+        ])
+        self.scale_gate = nn.Sequential(
+            nn.LayerNorm(int(hidden_dim) * len(dilation_values)),
+            nn.Linear(int(hidden_dim) * len(dilation_values), len(dilation_values)),
+        )
+        self.spatial_attention = GraphMaskedSpatialAttention(
+            hidden_dim=int(hidden_dim),
+            heads=int(heads),
+            dropout=float(dropout),
+            edge_bias=edge_bias,
+            edge_bias_init=edge_bias_init,
+            edge_bias_eps=edge_bias_eps,
+        )
+        self.st_fusion_gate = nn.Sequential(
+            nn.Linear(int(hidden_dim) * 2, int(hidden_dim)),
+            nn.Sigmoid(),
+        )
+        self.output_proj = nn.Sequential(
+            nn.LayerNorm(int(hidden_dim)),
+            nn.Linear(int(hidden_dim), int(hidden_dim)),
+            nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), self.num_for_predict * self.out_dim),
+        )
+        if bool(zero_init):
+            nn.init.zeros_(self.output_proj[-1].weight)
+            nn.init.zeros_(self.output_proj[-1].bias)
+        if self.bounded_alpha:
+            if self.alpha_max <= 0:
+                raise ValueError("alpha_max must be > 0 when bounded_alpha is enabled.")
+            init_ratio = float(residual_init) / self.alpha_max
+            init_ratio = min(max(init_ratio, 1e-4), 1.0 - 1e-4)
+            self.residual_alpha = nn.Parameter(torch.tensor(math.log(init_ratio / (1.0 - init_ratio)), dtype=torch.float32))
+        else:
+            self.residual_alpha = nn.Parameter(torch.tensor(float(residual_init), dtype=torch.float32))
+
+    def residual_scale(self):
+        if self.bounded_alpha:
+            return self.alpha_max * torch.sigmoid(self.residual_alpha)
+        return self.residual_alpha
+
+    def forward(self, x, adj_for_run=None):
+        # x: (B, N, F, T). The branch returns a small residual in scaled target space.
+        batch_size, num_nodes, _, hist_len = x.shape
+        hidden = self.input_proj(x.permute(0, 1, 3, 2))
+        hidden = hidden.reshape(batch_size * num_nodes, hist_len, -1).transpose(1, 2)
+
+        scale_states = []
+        for block in self.scale_blocks:
+            scale_states.append(block(hidden)[:, :, -1].view(batch_size, num_nodes, -1))
+        stacked = torch.stack(scale_states, dim=2)
+        gate_input = torch.cat(scale_states, dim=-1)
+        scale_weights = torch.softmax(self.scale_gate(gate_input), dim=-1)
+        temporal_state = torch.sum(stacked * scale_weights.unsqueeze(-1), dim=2)
+
+        spatial_state = self.spatial_attention(temporal_state, adj_for_run)
+        gate = self.st_fusion_gate(torch.cat([spatial_state, temporal_state], dim=-1))
+        fused = gate * spatial_state + (1.0 - gate) * temporal_state
+        residual = self.output_proj(fused).view(batch_size, num_nodes, self.num_for_predict, self.out_dim)
+        residual = residual.permute(0, 2, 1, 3)
+        return self.residual_scale() * residual
+
+
 class cheb_conv(nn.Module):
     '''
     K-order chebyshev graph convolution
@@ -670,6 +769,19 @@ class MSTGCN_submodule(nn.Module):
         ast_tcn_edge_bias=False,
         ast_tcn_edge_bias_init=0.1,
         ast_tcn_edge_bias_eps=1e-6,
+        sthybrid_ms_residual=False,
+        sthybrid_ms_hidden_dim=32,
+        sthybrid_ms_dilations=None,
+        sthybrid_ms_kernel_size=3,
+        sthybrid_ms_heads=4,
+        sthybrid_ms_dropout=0.1,
+        sthybrid_ms_residual_init=0.01,
+        sthybrid_ms_bounded_alpha=True,
+        sthybrid_ms_alpha_max=0.1,
+        sthybrid_ms_zero_init=True,
+        sthybrid_ms_edge_bias=True,
+        sthybrid_ms_edge_bias_init=0.05,
+        sthybrid_ms_edge_bias_eps=1e-6,
     ):
 
 
@@ -800,6 +912,28 @@ class MSTGCN_submodule(nn.Module):
                 edge_bias_eps=ast_tcn_edge_bias_eps,
             )
 
+        self.use_sthybrid_ms_residual = bool(sthybrid_ms_residual)
+        if self.use_sthybrid_ms_residual:
+            if sthybrid_ms_dilations is None:
+                sthybrid_ms_dilations = (1, 2, 4, 8)
+            self.sthybrid_ms_branch = STHybridMultiScaleResidualBranch(
+                in_channels=effective_in_channels,
+                hidden_dim=sthybrid_ms_hidden_dim,
+                num_for_predict=num_for_predict,
+                out_dim=out_dim,
+                dilations=sthybrid_ms_dilations,
+                kernel_size=sthybrid_ms_kernel_size,
+                heads=sthybrid_ms_heads,
+                dropout=sthybrid_ms_dropout,
+                residual_init=sthybrid_ms_residual_init,
+                bounded_alpha=sthybrid_ms_bounded_alpha,
+                alpha_max=sthybrid_ms_alpha_max,
+                zero_init=sthybrid_ms_zero_init,
+                edge_bias=sthybrid_ms_edge_bias,
+                edge_bias_init=sthybrid_ms_edge_bias_init,
+                edge_bias_eps=sthybrid_ms_edge_bias_eps,
+            )
+
         self.DEVICE = DEVICE
         self.num_for_predict = num_for_predict
         self.out_dim = out_dim
@@ -866,5 +1000,7 @@ class MSTGCN_submodule(nn.Module):
 
         if self.use_ast_tcn_residual:
             output = output + self.ast_tcn_branch(branch_x, adj_for_run=adj_for_run)
+        if self.use_sthybrid_ms_residual:
+            output = output + self.sthybrid_ms_branch(branch_x, adj_for_run=adj_for_run)
 
         return output

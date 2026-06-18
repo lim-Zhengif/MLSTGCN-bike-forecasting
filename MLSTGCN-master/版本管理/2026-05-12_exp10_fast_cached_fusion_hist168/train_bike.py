@@ -291,6 +291,19 @@ parser.add_argument('--ast_tcn_residual_gate_init', type=float, default=0.2)
 parser.add_argument('--ast_tcn_edge_bias', default='false', help="Use 'true' or 'false' to add fused-graph edge weights as spatial-attention score bias.")
 parser.add_argument('--ast_tcn_edge_bias_init', type=float, default=0.1)
 parser.add_argument('--ast_tcn_edge_bias_eps', type=float, default=1e-6)
+parser.add_argument('--sthybrid_ms_residual', default='false', help="Use 'true' or 'false' to add a ST-Hybrid-style multi-scale temporal residual branch.")
+parser.add_argument('--sthybrid_ms_hidden_dim', type=int, default=32)
+parser.add_argument('--sthybrid_ms_dilations', default='1,2,4,8', help="Comma-separated dilation set for the ST-Hybrid multi-scale branch.")
+parser.add_argument('--sthybrid_ms_kernel_size', type=int, default=3)
+parser.add_argument('--sthybrid_ms_heads', type=int, default=4)
+parser.add_argument('--sthybrid_ms_dropout', type=float, default=0.1)
+parser.add_argument('--sthybrid_ms_residual_init', type=float, default=0.01)
+parser.add_argument('--sthybrid_ms_bounded_alpha', default='true', help="Use 'true' or 'false' to bound the ST-Hybrid residual scale.")
+parser.add_argument('--sthybrid_ms_alpha_max', type=float, default=0.1)
+parser.add_argument('--sthybrid_ms_zero_init', default='true', help="Use 'true' or 'false' to zero-init the ST-Hybrid residual output head.")
+parser.add_argument('--sthybrid_ms_edge_bias', default='true', help="Use 'true' or 'false' to add fused-graph edge bias to the ST-Hybrid spatial attention.")
+parser.add_argument('--sthybrid_ms_edge_bias_init', type=float, default=0.05)
+parser.add_argument('--sthybrid_ms_edge_bias_eps', type=float, default=1e-6)
 parser.add_argument('--d2_hidden_dim', type=int, default=64)
 parser.add_argument('--d2_num_layers', type=int, default=4)
 parser.add_argument('--d2_dropout', type=float, default=0.1)
@@ -380,6 +393,21 @@ def parse_float_list(value, flag_name):
     return values
 
 
+def parse_int_list(value, flag_name):
+    if value is None or str(value).strip() == '':
+        return []
+    values = []
+    for item in str(value).split(','):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            values.append(int(item))
+        except ValueError:
+            parser.error('%s only accepts comma-separated integers, got: %s' % (flag_name, item))
+    return values
+
+
 args.graph_attention = parse_bool_arg(args.graph_attention, '--graph_attention')
 args.matrix_weight = parse_bool_arg(args.matrix_weight, '--matrix_weight')
 args.graph_fix_weight = parse_bool_arg(args.graph_fix_weight, '--graph_fix_weight')
@@ -409,6 +437,10 @@ args.ast_tcn_horizon_alpha = parse_bool_arg(args.ast_tcn_horizon_alpha, '--ast_t
 args.ast_tcn_zero_init = parse_bool_arg(args.ast_tcn_zero_init, '--ast_tcn_zero_init')
 args.ast_tcn_residual_gate = parse_bool_arg(args.ast_tcn_residual_gate, '--ast_tcn_residual_gate')
 args.ast_tcn_edge_bias = parse_bool_arg(args.ast_tcn_edge_bias, '--ast_tcn_edge_bias')
+args.sthybrid_ms_residual = parse_bool_arg(args.sthybrid_ms_residual, '--sthybrid_ms_residual')
+args.sthybrid_ms_bounded_alpha = parse_bool_arg(args.sthybrid_ms_bounded_alpha, '--sthybrid_ms_bounded_alpha')
+args.sthybrid_ms_zero_init = parse_bool_arg(args.sthybrid_ms_zero_init, '--sthybrid_ms_zero_init')
+args.sthybrid_ms_edge_bias = parse_bool_arg(args.sthybrid_ms_edge_bias, '--sthybrid_ms_edge_bias')
 args.channel_attention = parse_bool_arg(args.channel_attention, '--channel_attention')
 args.d2_adaptive_adj = parse_bool_arg(args.d2_adaptive_adj, '--d2_adaptive_adj')
 args.d2_use_reverse = parse_bool_arg(args.d2_use_reverse, '--d2_use_reverse')
@@ -419,6 +451,7 @@ args.ast_tcn_residual_horizon_mask = parse_float_list(
     args.ast_tcn_residual_horizon_mask,
     '--ast_tcn_residual_horizon_mask',
 )
+args.sthybrid_ms_dilations = parse_int_list(args.sthybrid_ms_dilations, '--sthybrid_ms_dilations')
 
 if args.graph_topk < 0:
     parser.error('--graph_topk must be >= 0.')
@@ -511,6 +544,28 @@ if args.ast_tcn_edge_bias_init < 0:
     parser.error('--ast_tcn_edge_bias_init must be >= 0.')
 if args.ast_tcn_edge_bias_eps <= 0:
     parser.error('--ast_tcn_edge_bias_eps must be > 0.')
+if args.sthybrid_ms_hidden_dim <= 0:
+    parser.error('--sthybrid_ms_hidden_dim must be > 0.')
+if not args.sthybrid_ms_dilations:
+    parser.error('--sthybrid_ms_dilations must include at least one dilation.')
+if any(dilation <= 0 for dilation in args.sthybrid_ms_dilations):
+    parser.error('--sthybrid_ms_dilations values must be > 0.')
+if args.sthybrid_ms_kernel_size <= 0:
+    parser.error('--sthybrid_ms_kernel_size must be > 0.')
+if args.sthybrid_ms_heads <= 0:
+    parser.error('--sthybrid_ms_heads must be > 0.')
+if args.sthybrid_ms_dropout < 0:
+    parser.error('--sthybrid_ms_dropout must be >= 0.')
+if args.sthybrid_ms_alpha_max <= 0:
+    parser.error('--sthybrid_ms_alpha_max must be > 0.')
+if args.sthybrid_ms_bounded_alpha and not (0.0 <= args.sthybrid_ms_residual_init <= args.sthybrid_ms_alpha_max):
+    parser.error('--sthybrid_ms_residual_init must be within [0, --sthybrid_ms_alpha_max] when --sthybrid_ms_bounded_alpha true.')
+if args.sthybrid_ms_edge_bias_init < 0:
+    parser.error('--sthybrid_ms_edge_bias_init must be >= 0.')
+if args.sthybrid_ms_edge_bias_eps <= 0:
+    parser.error('--sthybrid_ms_edge_bias_eps must be > 0.')
+if args.ast_tcn_residual and args.sthybrid_ms_residual:
+    parser.error('Use only one residual time branch: --ast_tcn_residual or --sthybrid_ms_residual.')
 if args.fusion_heads <= 0:
     parser.error('--fusion_heads must be > 0.')
 if args.fusion_head_dim <= 0:
@@ -651,6 +706,19 @@ hyperparameter_defaults = dict(
         ast_tcn_edge_bias=args.ast_tcn_edge_bias,
         ast_tcn_edge_bias_init=args.ast_tcn_edge_bias_init,
         ast_tcn_edge_bias_eps=args.ast_tcn_edge_bias_eps,
+        sthybrid_ms_residual=args.sthybrid_ms_residual,
+        sthybrid_ms_hidden_dim=args.sthybrid_ms_hidden_dim,
+        sthybrid_ms_dilations=args.sthybrid_ms_dilations,
+        sthybrid_ms_kernel_size=args.sthybrid_ms_kernel_size,
+        sthybrid_ms_heads=args.sthybrid_ms_heads,
+        sthybrid_ms_dropout=args.sthybrid_ms_dropout,
+        sthybrid_ms_residual_init=args.sthybrid_ms_residual_init,
+        sthybrid_ms_bounded_alpha=args.sthybrid_ms_bounded_alpha,
+        sthybrid_ms_alpha_max=args.sthybrid_ms_alpha_max,
+        sthybrid_ms_zero_init=args.sthybrid_ms_zero_init,
+        sthybrid_ms_edge_bias=args.sthybrid_ms_edge_bias,
+        sthybrid_ms_edge_bias_init=args.sthybrid_ms_edge_bias_init,
+        sthybrid_ms_edge_bias_eps=args.sthybrid_ms_edge_bias_eps,
         d2_hidden_dim=args.d2_hidden_dim,
         d2_num_layers=args.d2_num_layers,
         d2_dropout=args.d2_dropout,
@@ -1212,6 +1280,19 @@ class LightningModel(LightningModule):
                 ast_tcn_edge_bias=config['model']['ast_tcn_edge_bias'],
                 ast_tcn_edge_bias_init=config['model']['ast_tcn_edge_bias_init'],
                 ast_tcn_edge_bias_eps=config['model']['ast_tcn_edge_bias_eps'],
+                sthybrid_ms_residual=config['model']['sthybrid_ms_residual'],
+                sthybrid_ms_hidden_dim=config['model']['sthybrid_ms_hidden_dim'],
+                sthybrid_ms_dilations=config['model']['sthybrid_ms_dilations'],
+                sthybrid_ms_kernel_size=config['model']['sthybrid_ms_kernel_size'],
+                sthybrid_ms_heads=config['model']['sthybrid_ms_heads'],
+                sthybrid_ms_dropout=config['model']['sthybrid_ms_dropout'],
+                sthybrid_ms_residual_init=config['model']['sthybrid_ms_residual_init'],
+                sthybrid_ms_bounded_alpha=config['model']['sthybrid_ms_bounded_alpha'],
+                sthybrid_ms_alpha_max=config['model']['sthybrid_ms_alpha_max'],
+                sthybrid_ms_zero_init=config['model']['sthybrid_ms_zero_init'],
+                sthybrid_ms_edge_bias=config['model']['sthybrid_ms_edge_bias'],
+                sthybrid_ms_edge_bias_init=config['model']['sthybrid_ms_edge_bias_init'],
+                sthybrid_ms_edge_bias_eps=config['model']['sthybrid_ms_edge_bias_eps'],
             )
         elif config['model']['use'] == 'D2STGNN':
             self.model = D2STGNNFusionBackbone(
@@ -1243,6 +1324,9 @@ class LightningModel(LightningModule):
             ):
                 continue
             if config['model'].get('ast_tcn_zero_init', False) and param_name.startswith('ast_tcn_branch.output_proj.4.'):
+                nn.init.zeros_(param)
+                continue
+            if config['model'].get('sthybrid_ms_zero_init', False) and param_name.startswith('sthybrid_ms_branch.output_proj.4.'):
                 nn.init.zeros_(param)
                 continue
             if config['model'].get('ast_tcn_residual_gate', False) and param_name.startswith('ast_tcn_branch.residual_gate.4.'):
