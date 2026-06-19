@@ -288,6 +288,11 @@ parser.add_argument('--ast_tcn_zero_init', default='false', help="Use 'true' or 
 parser.add_argument('--ast_tcn_residual_gate', default='false', help="Use 'true' or 'false' to learn a dynamic gate for the AST-TCN residual branch.")
 parser.add_argument('--ast_tcn_residual_gate_hidden_dim', type=int, default=16)
 parser.add_argument('--ast_tcn_residual_gate_init', type=float, default=0.2)
+parser.add_argument('--ast_tcn_anchor_horizon_gate', default='false', help="Use 'true' or 'false' to gate AST-TCN residuals by anchor hour, horizon, and pooled state.")
+parser.add_argument('--ast_tcn_anchor_embed_dim', type=int, default=8)
+parser.add_argument('--ast_tcn_horizon_embed_dim', type=int, default=4)
+parser.add_argument('--ast_tcn_anchor_horizon_gate_hidden_dim', type=int, default=16)
+parser.add_argument('--ast_tcn_anchor_horizon_gate_init', type=float, default=0.2)
 parser.add_argument('--ast_tcn_edge_bias', default='false', help="Use 'true' or 'false' to add fused-graph edge weights as spatial-attention score bias.")
 parser.add_argument('--ast_tcn_edge_bias_init', type=float, default=0.1)
 parser.add_argument('--ast_tcn_edge_bias_eps', type=float, default=1e-6)
@@ -436,6 +441,7 @@ args.ast_tcn_bounded_alpha = parse_bool_arg(args.ast_tcn_bounded_alpha, '--ast_t
 args.ast_tcn_horizon_alpha = parse_bool_arg(args.ast_tcn_horizon_alpha, '--ast_tcn_horizon_alpha')
 args.ast_tcn_zero_init = parse_bool_arg(args.ast_tcn_zero_init, '--ast_tcn_zero_init')
 args.ast_tcn_residual_gate = parse_bool_arg(args.ast_tcn_residual_gate, '--ast_tcn_residual_gate')
+args.ast_tcn_anchor_horizon_gate = parse_bool_arg(args.ast_tcn_anchor_horizon_gate, '--ast_tcn_anchor_horizon_gate')
 args.ast_tcn_edge_bias = parse_bool_arg(args.ast_tcn_edge_bias, '--ast_tcn_edge_bias')
 args.sthybrid_ms_residual = parse_bool_arg(args.sthybrid_ms_residual, '--sthybrid_ms_residual')
 args.sthybrid_ms_bounded_alpha = parse_bool_arg(args.sthybrid_ms_bounded_alpha, '--sthybrid_ms_bounded_alpha')
@@ -540,6 +546,16 @@ if args.ast_tcn_residual_gate_hidden_dim <= 0:
     parser.error('--ast_tcn_residual_gate_hidden_dim must be > 0.')
 if not (0.0 < args.ast_tcn_residual_gate_init < 1.0):
     parser.error('--ast_tcn_residual_gate_init must be within (0, 1).')
+if args.ast_tcn_anchor_horizon_gate and not args.ast_tcn_residual:
+    parser.error('--ast_tcn_anchor_horizon_gate requires --ast_tcn_residual true.')
+if args.ast_tcn_anchor_embed_dim <= 0:
+    parser.error('--ast_tcn_anchor_embed_dim must be > 0.')
+if args.ast_tcn_horizon_embed_dim <= 0:
+    parser.error('--ast_tcn_horizon_embed_dim must be > 0.')
+if args.ast_tcn_anchor_horizon_gate_hidden_dim <= 0:
+    parser.error('--ast_tcn_anchor_horizon_gate_hidden_dim must be > 0.')
+if not (0.0 < args.ast_tcn_anchor_horizon_gate_init < 1.0):
+    parser.error('--ast_tcn_anchor_horizon_gate_init must be within (0, 1).')
 if args.ast_tcn_edge_bias_init < 0:
     parser.error('--ast_tcn_edge_bias_init must be >= 0.')
 if args.ast_tcn_edge_bias_eps <= 0:
@@ -703,6 +719,11 @@ hyperparameter_defaults = dict(
         ast_tcn_residual_gate=args.ast_tcn_residual_gate,
         ast_tcn_residual_gate_hidden_dim=args.ast_tcn_residual_gate_hidden_dim,
         ast_tcn_residual_gate_init=args.ast_tcn_residual_gate_init,
+        ast_tcn_anchor_horizon_gate=args.ast_tcn_anchor_horizon_gate,
+        ast_tcn_anchor_embed_dim=args.ast_tcn_anchor_embed_dim,
+        ast_tcn_horizon_embed_dim=args.ast_tcn_horizon_embed_dim,
+        ast_tcn_anchor_horizon_gate_hidden_dim=args.ast_tcn_anchor_horizon_gate_hidden_dim,
+        ast_tcn_anchor_horizon_gate_init=args.ast_tcn_anchor_horizon_gate_init,
         ast_tcn_edge_bias=args.ast_tcn_edge_bias,
         ast_tcn_edge_bias_init=args.ast_tcn_edge_bias_init,
         ast_tcn_edge_bias_eps=args.ast_tcn_edge_bias_eps,
@@ -973,6 +994,7 @@ return_anchor = bool(
     config['train']['peak_anchor_loss_weight'] != 1.0
     or config['graph']['context_gate_anchor_hour']
     or config['graph']['horizon_graph_fusion_gate']
+    or config['model']['ast_tcn_anchor_horizon_gate']
     or config['train']['anchor_homogeneous_batches']
 )
 train_set = Bike(args.data_dir, 'train', return_anchor=return_anchor)
@@ -1277,6 +1299,11 @@ class LightningModel(LightningModule):
                 ast_tcn_residual_gate=config['model']['ast_tcn_residual_gate'],
                 ast_tcn_residual_gate_hidden_dim=config['model']['ast_tcn_residual_gate_hidden_dim'],
                 ast_tcn_residual_gate_init=config['model']['ast_tcn_residual_gate_init'],
+                ast_tcn_anchor_horizon_gate=config['model']['ast_tcn_anchor_horizon_gate'],
+                ast_tcn_anchor_embed_dim=config['model']['ast_tcn_anchor_embed_dim'],
+                ast_tcn_horizon_embed_dim=config['model']['ast_tcn_horizon_embed_dim'],
+                ast_tcn_anchor_horizon_gate_hidden_dim=config['model']['ast_tcn_anchor_horizon_gate_hidden_dim'],
+                ast_tcn_anchor_horizon_gate_init=config['model']['ast_tcn_anchor_horizon_gate_init'],
                 ast_tcn_edge_bias=config['model']['ast_tcn_edge_bias'],
                 ast_tcn_edge_bias_init=config['model']['ast_tcn_edge_bias_init'],
                 ast_tcn_edge_bias_eps=config['model']['ast_tcn_edge_bias_eps'],

@@ -378,6 +378,11 @@ class ASTTCNResidualBranch(nn.Module):
         residual_gate=False,
         residual_gate_hidden_dim=16,
         residual_gate_init=0.2,
+        anchor_horizon_gate=False,
+        anchor_embed_dim=8,
+        horizon_embed_dim=4,
+        anchor_horizon_gate_hidden_dim=16,
+        anchor_horizon_gate_init=0.2,
         edge_bias=False,
         edge_bias_init=0.1,
         edge_bias_eps=1e-6,
@@ -389,6 +394,7 @@ class ASTTCNResidualBranch(nn.Module):
         self.alpha_max = float(alpha_max)
         self.horizon_alpha = bool(horizon_alpha)
         self.use_residual_gate = bool(residual_gate)
+        self.use_anchor_horizon_gate = bool(anchor_horizon_gate)
         if (
             residual_horizon_mask is None
             or residual_horizon_mask == ""
@@ -456,6 +462,30 @@ class ASTTCNResidualBranch(nn.Module):
             gate_init = min(max(float(residual_gate_init), 1e-4), 1.0 - 1e-4)
             nn.init.zeros_(self.residual_gate[-2].weight)
             nn.init.constant_(self.residual_gate[-2].bias, math.log(gate_init / (1.0 - gate_init)))
+        if self.use_anchor_horizon_gate:
+            anchor_embed_dim = int(anchor_embed_dim)
+            horizon_embed_dim = int(horizon_embed_dim)
+            gate_hidden_dim = int(anchor_horizon_gate_hidden_dim)
+            if anchor_embed_dim <= 0:
+                anchor_embed_dim = 8
+            if horizon_embed_dim <= 0:
+                horizon_embed_dim = 4
+            if gate_hidden_dim <= 0:
+                gate_hidden_dim = max(int(hidden_dim) // 2, 1)
+            self.anchor_embedding = nn.Embedding(24, anchor_embed_dim)
+            self.horizon_embedding = nn.Embedding(self.num_for_predict, horizon_embed_dim)
+            gate_input_dim = int(hidden_dim) + anchor_embed_dim + horizon_embed_dim
+            self.anchor_horizon_gate = nn.Sequential(
+                nn.LayerNorm(gate_input_dim),
+                nn.Linear(gate_input_dim, gate_hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(float(dropout)),
+                nn.Linear(gate_hidden_dim, 1),
+                nn.Sigmoid(),
+            )
+            gate_init = min(max(float(anchor_horizon_gate_init), 1e-4), 1.0 - 1e-4)
+            nn.init.zeros_(self.anchor_horizon_gate[-2].weight)
+            nn.init.constant_(self.anchor_horizon_gate[-2].bias, math.log(gate_init / (1.0 - gate_init)))
         if bool(zero_init):
             nn.init.zeros_(self.output_proj[-1].weight)
             nn.init.zeros_(self.output_proj[-1].bias)
@@ -488,7 +518,7 @@ class ASTTCNResidualBranch(nn.Module):
             return scale.view(1, self.num_for_predict, 1, 1)
         return scale
 
-    def forward(self, x, adj_for_run=None):
+    def forward(self, x, adj_for_run=None, anchor_hours=None):
         # x: (B, N, F, T). This branch predicts a small residual in scaled target space.
         batch_size, num_nodes, _, hist_len = x.shape
         hidden = self.input_proj(x.permute(0, 1, 3, 2))  # (B, N, T, H)
@@ -505,6 +535,35 @@ class ASTTCNResidualBranch(nn.Module):
         if self.use_residual_gate:
             residual_gate = self.residual_gate(torch.cat([spatial_state, temporal_state], dim=-1))
             residual = residual * residual_gate.permute(0, 2, 1).unsqueeze(-1)
+        if self.use_anchor_horizon_gate:
+            if anchor_hours is None:
+                anchor_ids = torch.zeros(batch_size, dtype=torch.long, device=x.device)
+            else:
+                anchor_ids = anchor_hours.to(device=x.device, dtype=torch.long).view(-1).clamp(min=0, max=23)
+                if anchor_ids.numel() != batch_size:
+                    anchor_ids = anchor_ids[:batch_size]
+                    if anchor_ids.numel() < batch_size:
+                        pad = torch.zeros(batch_size - anchor_ids.numel(), dtype=torch.long, device=x.device)
+                        anchor_ids = torch.cat([anchor_ids, pad], dim=0)
+            pooled_state = fused.mean(dim=1)
+            anchor_emb = self.anchor_embedding(anchor_ids)
+            horizon_ids = torch.arange(self.num_for_predict, device=x.device, dtype=torch.long)
+            horizon_emb = self.horizon_embedding(horizon_ids)
+            gate_inputs = torch.cat(
+                [
+                    pooled_state.unsqueeze(1).expand(-1, self.num_for_predict, -1),
+                    anchor_emb.unsqueeze(1).expand(-1, self.num_for_predict, -1),
+                    horizon_emb.unsqueeze(0).expand(batch_size, -1, -1),
+                ],
+                dim=-1,
+            )
+            anchor_horizon_gate = self.anchor_horizon_gate(gate_inputs).view(
+                batch_size,
+                self.num_for_predict,
+                1,
+                1,
+            )
+            residual = residual * anchor_horizon_gate
         residual = residual * self.residual_horizon_mask.to(dtype=residual.dtype)
         return self.residual_scale_for_output() * residual
 
@@ -766,6 +825,11 @@ class MSTGCN_submodule(nn.Module):
         ast_tcn_residual_gate=False,
         ast_tcn_residual_gate_hidden_dim=16,
         ast_tcn_residual_gate_init=0.2,
+        ast_tcn_anchor_horizon_gate=False,
+        ast_tcn_anchor_embed_dim=8,
+        ast_tcn_horizon_embed_dim=4,
+        ast_tcn_anchor_horizon_gate_hidden_dim=16,
+        ast_tcn_anchor_horizon_gate_init=0.2,
         ast_tcn_edge_bias=False,
         ast_tcn_edge_bias_init=0.1,
         ast_tcn_edge_bias_eps=1e-6,
@@ -907,6 +971,11 @@ class MSTGCN_submodule(nn.Module):
                 residual_gate=ast_tcn_residual_gate,
                 residual_gate_hidden_dim=ast_tcn_residual_gate_hidden_dim,
                 residual_gate_init=ast_tcn_residual_gate_init,
+                anchor_horizon_gate=ast_tcn_anchor_horizon_gate,
+                anchor_embed_dim=ast_tcn_anchor_embed_dim,
+                horizon_embed_dim=ast_tcn_horizon_embed_dim,
+                anchor_horizon_gate_hidden_dim=ast_tcn_anchor_horizon_gate_hidden_dim,
+                anchor_horizon_gate_init=ast_tcn_anchor_horizon_gate_init,
                 edge_bias=ast_tcn_edge_bias,
                 edge_bias_init=ast_tcn_edge_bias_init,
                 edge_bias_eps=ast_tcn_edge_bias_eps,
@@ -999,7 +1068,7 @@ class MSTGCN_submodule(nn.Module):
             output = output.permute(0, 1, 3, 2)
 
         if self.use_ast_tcn_residual:
-            output = output + self.ast_tcn_branch(branch_x, adj_for_run=adj_for_run)
+            output = output + self.ast_tcn_branch(branch_x, adj_for_run=adj_for_run, anchor_hours=anchor_hours)
         if self.use_sthybrid_ms_residual:
             output = output + self.sthybrid_ms_branch(branch_x, adj_for_run=adj_for_run)
 
