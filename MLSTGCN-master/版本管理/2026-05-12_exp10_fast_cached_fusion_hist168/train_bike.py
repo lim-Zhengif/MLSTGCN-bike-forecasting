@@ -295,6 +295,8 @@ parser.add_argument('--ast_tcn_anchor_horizon_gate_hidden_dim', type=int, defaul
 parser.add_argument('--ast_tcn_anchor_horizon_gate_init', type=float, default=0.2)
 parser.add_argument('--ast_tcn_edge_bias', default='false', help="Use 'true' or 'false' to add fused-graph edge weights as spatial-attention score bias.")
 parser.add_argument('--ast_tcn_edge_bias_init', type=float, default=0.1)
+parser.add_argument('--ast_tcn_hgaurban_edge_bias', default='false', help="Use 'true' or 'false' to add HGAurban prior as an extra AST-TCN spatial-attention edge bias without adding it to graph fusion.")
+parser.add_argument('--ast_tcn_hgaurban_edge_bias_init', type=float, default=0.03)
 parser.add_argument('--ast_tcn_edge_bias_eps', type=float, default=1e-6)
 parser.add_argument('--sthybrid_ms_residual', default='false', help="Use 'true' or 'false' to add a ST-Hybrid-style multi-scale temporal residual branch.")
 parser.add_argument('--sthybrid_ms_hidden_dim', type=int, default=32)
@@ -443,6 +445,7 @@ args.ast_tcn_zero_init = parse_bool_arg(args.ast_tcn_zero_init, '--ast_tcn_zero_
 args.ast_tcn_residual_gate = parse_bool_arg(args.ast_tcn_residual_gate, '--ast_tcn_residual_gate')
 args.ast_tcn_anchor_horizon_gate = parse_bool_arg(args.ast_tcn_anchor_horizon_gate, '--ast_tcn_anchor_horizon_gate')
 args.ast_tcn_edge_bias = parse_bool_arg(args.ast_tcn_edge_bias, '--ast_tcn_edge_bias')
+args.ast_tcn_hgaurban_edge_bias = parse_bool_arg(args.ast_tcn_hgaurban_edge_bias, '--ast_tcn_hgaurban_edge_bias')
 args.sthybrid_ms_residual = parse_bool_arg(args.sthybrid_ms_residual, '--sthybrid_ms_residual')
 args.sthybrid_ms_bounded_alpha = parse_bool_arg(args.sthybrid_ms_bounded_alpha, '--sthybrid_ms_bounded_alpha')
 args.sthybrid_ms_zero_init = parse_bool_arg(args.sthybrid_ms_zero_init, '--sthybrid_ms_zero_init')
@@ -558,6 +561,10 @@ if not (0.0 < args.ast_tcn_anchor_horizon_gate_init < 1.0):
     parser.error('--ast_tcn_anchor_horizon_gate_init must be within (0, 1).')
 if args.ast_tcn_edge_bias_init < 0:
     parser.error('--ast_tcn_edge_bias_init must be >= 0.')
+if args.ast_tcn_hgaurban_edge_bias and not args.ast_tcn_residual:
+    parser.error('--ast_tcn_hgaurban_edge_bias requires --ast_tcn_residual true.')
+if args.ast_tcn_hgaurban_edge_bias_init < 0:
+    parser.error('--ast_tcn_hgaurban_edge_bias_init must be >= 0.')
 if args.ast_tcn_edge_bias_eps <= 0:
     parser.error('--ast_tcn_edge_bias_eps must be > 0.')
 if args.sthybrid_ms_hidden_dim <= 0:
@@ -726,6 +733,8 @@ hyperparameter_defaults = dict(
         ast_tcn_anchor_horizon_gate_init=args.ast_tcn_anchor_horizon_gate_init,
         ast_tcn_edge_bias=args.ast_tcn_edge_bias,
         ast_tcn_edge_bias_init=args.ast_tcn_edge_bias_init,
+        ast_tcn_hgaurban_edge_bias=args.ast_tcn_hgaurban_edge_bias,
+        ast_tcn_hgaurban_edge_bias_init=args.ast_tcn_hgaurban_edge_bias_init,
         ast_tcn_edge_bias_eps=args.ast_tcn_edge_bias_eps,
         sthybrid_ms_residual=args.sthybrid_ms_residual,
         sthybrid_ms_hidden_dim=args.sthybrid_ms_hidden_dim,
@@ -969,6 +978,8 @@ if args.hgaurban_graph_prior_path:
     if not os.path.exists(args.hgaurban_graph_prior_path):
         parser.error('--hgaurban_graph_prior_path does not exist: %s' % args.hgaurban_graph_prior_path)
     config['graph']['hgaurban_graph_prior_path'] = args.hgaurban_graph_prior_path
+if config['model']['ast_tcn_hgaurban_edge_bias'] and not config['graph'].get('hgaurban_graph_prior_path'):
+    parser.error('--ast_tcn_hgaurban_edge_bias requires --hgaurban_graph_prior_path.')
 if args.cssg_rw_graph_prior_path:
     args.cssg_rw_graph_prior_path = resolve_project_path(PROJECT_ROOT, args.cssg_rw_graph_prior_path)
     if not os.path.exists(args.cssg_rw_graph_prior_path):
@@ -1257,6 +1268,11 @@ class LightningModel(LightningModule):
             self.loss = nn.L1Loss(reduction='mean')
 
         if config['model']['use'] == 'MSTGCN':
+            hgaurban_edge_bias_matrix = None
+            if config['model'].get('ast_tcn_hgaurban_edge_bias', False):
+                hgaurban_edge_bias_matrix = np.float32(
+                    np.load(config['graph']['hgaurban_graph_prior_path'])
+                )
             self.model = MSTGCN_submodule(
                 device,
                 fusiongraph,
@@ -1306,6 +1322,9 @@ class LightningModel(LightningModule):
                 ast_tcn_anchor_horizon_gate_init=config['model']['ast_tcn_anchor_horizon_gate_init'],
                 ast_tcn_edge_bias=config['model']['ast_tcn_edge_bias'],
                 ast_tcn_edge_bias_init=config['model']['ast_tcn_edge_bias_init'],
+                ast_tcn_hgaurban_edge_bias=config['model']['ast_tcn_hgaurban_edge_bias'],
+                ast_tcn_hgaurban_edge_bias_init=config['model']['ast_tcn_hgaurban_edge_bias_init'],
+                hgaurban_edge_bias_matrix=hgaurban_edge_bias_matrix,
                 ast_tcn_edge_bias_eps=config['model']['ast_tcn_edge_bias_eps'],
                 sthybrid_ms_residual=config['model']['sthybrid_ms_residual'],
                 sthybrid_ms_hidden_dim=config['model']['sthybrid_ms_hidden_dim'],

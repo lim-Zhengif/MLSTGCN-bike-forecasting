@@ -276,6 +276,8 @@ class GraphMaskedSpatialAttention(nn.Module):
         dropout=0.1,
         edge_bias=False,
         edge_bias_init=0.1,
+        extra_edge_bias=False,
+        extra_edge_bias_init=0.0,
         edge_bias_eps=1e-6,
     ):
         super(GraphMaskedSpatialAttention, self).__init__()
@@ -297,6 +299,11 @@ class GraphMaskedSpatialAttention(nn.Module):
             if self.edge_bias_eps <= 0:
                 raise ValueError("edge_bias_eps must be > 0 when edge_bias is enabled.")
             self.edge_bias_scale = nn.Parameter(torch.tensor(float(edge_bias_init), dtype=torch.float32))
+        self.extra_edge_bias = bool(extra_edge_bias)
+        if self.extra_edge_bias:
+            if self.edge_bias_eps <= 0:
+                raise ValueError("edge_bias_eps must be > 0 when extra_edge_bias is enabled.")
+            self.extra_edge_bias_scale = nn.Parameter(torch.tensor(float(extra_edge_bias_init), dtype=torch.float32))
 
     def _prepare_graph_mask(self, adj_for_run, batch_size, num_nodes, device):
         graph_mask = adj_for_run.detach() > 0
@@ -332,7 +339,7 @@ class GraphMaskedSpatialAttention(nn.Module):
             return torch.log(adj_norm).view(batch_size, 1, num_nodes, num_nodes)
         raise ValueError("adj_for_run must be a 2D or 3D adjacency tensor.")
 
-    def forward(self, node_state, adj_for_run):
+    def forward(self, node_state, adj_for_run, extra_edge_bias_adj=None):
         batch_size, num_nodes, hidden_dim = node_state.shape
         q = self.q_proj(node_state).view(batch_size, num_nodes, self.heads, self.head_dim).permute(0, 2, 1, 3)
         k = self.k_proj(node_state).view(batch_size, num_nodes, self.heads, self.head_dim).permute(0, 2, 1, 3)
@@ -350,6 +357,15 @@ class GraphMaskedSpatialAttention(nn.Module):
                     scores.dtype,
                 )
                 scores = scores + self.edge_bias_scale.to(dtype=scores.dtype) * edge_bias
+            if self.extra_edge_bias and extra_edge_bias_adj is not None:
+                extra_edge_bias = self._prepare_edge_bias(
+                    extra_edge_bias_adj,
+                    batch_size,
+                    num_nodes,
+                    node_state.device,
+                    scores.dtype,
+                )
+                scores = scores + self.extra_edge_bias_scale.to(dtype=scores.dtype) * extra_edge_bias
             scores = scores.masked_fill(~graph_mask, -1e9)
         attn = torch.softmax(scores, dim=-1)
         attn = self.dropout(attn)
@@ -385,6 +401,8 @@ class ASTTCNResidualBranch(nn.Module):
         anchor_horizon_gate_init=0.2,
         edge_bias=False,
         edge_bias_init=0.1,
+        hgaurban_edge_bias=False,
+        hgaurban_edge_bias_init=0.0,
         edge_bias_eps=1e-6,
     ):
         super(ASTTCNResidualBranch, self).__init__()
@@ -434,6 +452,8 @@ class ASTTCNResidualBranch(nn.Module):
             dropout=float(dropout),
             edge_bias=edge_bias,
             edge_bias_init=edge_bias_init,
+            extra_edge_bias=hgaurban_edge_bias,
+            extra_edge_bias_init=hgaurban_edge_bias_init,
             edge_bias_eps=edge_bias_eps,
         )
         self.stim_gate = nn.Sequential(
@@ -518,7 +538,7 @@ class ASTTCNResidualBranch(nn.Module):
             return scale.view(1, self.num_for_predict, 1, 1)
         return scale
 
-    def forward(self, x, adj_for_run=None, anchor_hours=None):
+    def forward(self, x, adj_for_run=None, anchor_hours=None, hgaurban_adj=None):
         # x: (B, N, F, T). This branch predicts a small residual in scaled target space.
         batch_size, num_nodes, _, hist_len = x.shape
         hidden = self.input_proj(x.permute(0, 1, 3, 2))  # (B, N, T, H)
@@ -527,7 +547,11 @@ class ASTTCNResidualBranch(nn.Module):
             hidden = block(hidden)
         temporal_state = hidden[:, :, -1].view(batch_size, num_nodes, -1)
 
-        spatial_state = self.spatial_attention(temporal_state, adj_for_run)
+        spatial_state = self.spatial_attention(
+            temporal_state,
+            adj_for_run,
+            extra_edge_bias_adj=hgaurban_adj,
+        )
         gate = self.stim_gate(torch.cat([spatial_state, temporal_state], dim=-1))
         fused = gate * spatial_state + (1.0 - gate) * temporal_state
         residual = self.output_proj(fused).view(batch_size, num_nodes, self.num_for_predict, self.out_dim)
@@ -832,6 +856,9 @@ class MSTGCN_submodule(nn.Module):
         ast_tcn_anchor_horizon_gate_init=0.2,
         ast_tcn_edge_bias=False,
         ast_tcn_edge_bias_init=0.1,
+        ast_tcn_hgaurban_edge_bias=False,
+        ast_tcn_hgaurban_edge_bias_init=0.0,
+        hgaurban_edge_bias_matrix=None,
         ast_tcn_edge_bias_eps=1e-6,
         sthybrid_ms_residual=False,
         sthybrid_ms_hidden_dim=32,
@@ -951,6 +978,14 @@ class MSTGCN_submodule(nn.Module):
             )
 
         self.use_ast_tcn_residual = bool(ast_tcn_residual)
+        self.use_ast_tcn_hgaurban_edge_bias = bool(ast_tcn_hgaurban_edge_bias)
+        if self.use_ast_tcn_hgaurban_edge_bias:
+            if hgaurban_edge_bias_matrix is None:
+                raise ValueError("ast_tcn_hgaurban_edge_bias requires hgaurban_edge_bias_matrix.")
+            hgaurban_tensor = torch.as_tensor(hgaurban_edge_bias_matrix, dtype=torch.float32)
+            self.register_buffer("hgaurban_edge_bias_matrix", hgaurban_tensor)
+        else:
+            self.hgaurban_edge_bias_matrix = None
         if self.use_ast_tcn_residual:
             self.ast_tcn_branch = ASTTCNResidualBranch(
                 in_channels=effective_in_channels,
@@ -978,6 +1013,8 @@ class MSTGCN_submodule(nn.Module):
                 anchor_horizon_gate_init=ast_tcn_anchor_horizon_gate_init,
                 edge_bias=ast_tcn_edge_bias,
                 edge_bias_init=ast_tcn_edge_bias_init,
+                hgaurban_edge_bias=ast_tcn_hgaurban_edge_bias,
+                hgaurban_edge_bias_init=ast_tcn_hgaurban_edge_bias_init,
                 edge_bias_eps=ast_tcn_edge_bias_eps,
             )
 
@@ -1068,7 +1105,17 @@ class MSTGCN_submodule(nn.Module):
             output = output.permute(0, 1, 3, 2)
 
         if self.use_ast_tcn_residual:
-            output = output + self.ast_tcn_branch(branch_x, adj_for_run=adj_for_run, anchor_hours=anchor_hours)
+            hgaurban_adj = (
+                self.hgaurban_edge_bias_matrix.to(device=branch_x.device, dtype=branch_x.dtype)
+                if self.use_ast_tcn_hgaurban_edge_bias
+                else None
+            )
+            output = output + self.ast_tcn_branch(
+                branch_x,
+                adj_for_run=adj_for_run,
+                anchor_hours=anchor_hours,
+                hgaurban_adj=hgaurban_adj,
+            )
         if self.use_sthybrid_ms_residual:
             output = output + self.sthybrid_ms_branch(branch_x, adj_for_run=adj_for_run)
 
