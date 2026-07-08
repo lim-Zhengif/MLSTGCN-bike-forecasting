@@ -1,0 +1,1797 @@
+# For relative import
+import os
+import sys
+
+PROJ_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, PROJ_DIR)
+
+
+def detect_project_root(start_dir):
+    current = os.path.abspath(start_dir)
+    while True:
+        if (
+            os.path.isdir(os.path.join(current, '二月份数据处理'))
+            and os.path.isdir(os.path.join(current, 'models'))
+            and os.path.isdir(os.path.join(current, 'datasets'))
+        ):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return os.path.abspath(start_dir)
+        current = parent
+
+
+PROJECT_ROOT = detect_project_root(PROJ_DIR)
+
+import argparse
+import json
+import math
+import subprocess
+
+import numpy as np
+from torch import nn
+from torch.optim import Adam
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import BatchSampler, DataLoader, Sampler
+import torch
+import torch.nn.functional as F
+import random
+import pytorch_lightning as pl
+from pytorch_lightning import LightningDataModule, LightningModule, Trainer
+from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.loggers import CSVLogger
+
+try:
+    from pytorch_lightning.loggers import WandbLogger
+except ImportError:
+    WandbLogger = None
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+from datasets.bike import Bike, BikeGraph
+from models.D2STGNN import D2STGNNFusionBackbone
+from models.MSTGCN import MSTGCN_submodule
+from models.fusiongraph import FusionGraphModel
+from util import LightningMetric, masked_huber, masked_mae
+from analysis_result_utils import build_analysis_task_dir, build_and_save_analysis_registry, ensure_analysis_dir
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--device', default='auto', help="Use 'auto', 'cpu', or a cuda device such as 'cuda:0'.")
+parser.add_argument('--epochs', type=int, default=40)
+parser.add_argument('--batch_size', type=int, default=32)
+parser.add_argument('--hist_len', type=int, default=7)
+parser.add_argument('--pred_len', type=int, default=1)
+parser.add_argument('--data_dir', default=os.path.join('data', 'temporal_data', 'bike'))
+parser.add_argument('--graph_dir', default=os.path.join('data', 'graph', 'bike'))
+parser.add_argument('--project', default='bike')
+parser.add_argument('--logger', choices=['auto', 'csv', 'wandb'], default='auto')
+parser.add_argument('--wandb_project', default=None)
+parser.add_argument('--wandb_run_name', default=None)
+parser.add_argument('--early_stop_patience', type=int, default=10)
+parser.add_argument('--lr', type=float, default=1e-4)
+parser.add_argument('--weight_decay', type=float, default=1e-4)
+parser.add_argument('--lr_patience', type=int, default=4)
+parser.add_argument('--lr_factor', type=float, default=0.5)
+parser.add_argument('--min_lr', type=float, default=1e-6)
+
+# Training/runtime controls exposed for fast CLI experimentation.
+parser.add_argument('--seed', type=int, default=0, help='Random seed for training reproducibility.')
+parser.add_argument('--num_workers', type=int, default=0, help='DataLoader worker count. Increase if data loading becomes a bottleneck.')
+parser.add_argument('--limit_train_batches', type=float, default=None, help='Lightning limit_train_batches. Omit for full data; integer values are treated as a batch count.')
+parser.add_argument('--limit_val_batches', type=float, default=None, help='Lightning limit_val_batches. Omit for full data; integer values are treated as a batch count.')
+parser.add_argument('--limit_test_batches', type=float, default=None, help='Lightning limit_test_batches. Omit for full data; integer values are treated as a batch count.')
+parser.add_argument('--num_sanity_val_steps', type=int, default=2, help='Lightning num_sanity_val_steps. Use 0 for quick smoke tests.')
+parser.add_argument('--save_checkpoints', default='true', help="Use 'false' for smoke tests that should not write checkpoint files.")
+parser.add_argument('--precision', default='32', help="Lightning precision mode, e.g. '32', '16-mixed', 'bf16-mixed'.")
+parser.add_argument('--grad_clip_val', type=float, default=0.0, help='Gradient clipping threshold. Set > 0 to stabilize harder runs.')
+parser.add_argument('--init_checkpoint', default=None, help='Optional checkpoint whose model weights are loaded before training starts.')
+parser.add_argument(
+    '--freeze_non_ast_tcn',
+    default='false',
+    help="Use 'true' to freeze all parameters except the AST-TCN residual branch after loading --init_checkpoint.",
+)
+parser.add_argument(
+    '--freeze_trainable_scope',
+    choices=['ast_tcn', 'ast_tcn_final_head'],
+    default='ast_tcn',
+    help=(
+        "Trainable scope used with --freeze_non_ast_tcn true. "
+        "'ast_tcn' keeps only the AST-TCN residual branch trainable; "
+        "'ast_tcn_final_head' also keeps the final prediction head trainable."
+    ),
+)
+parser.add_argument(
+    '--monitor_metric',
+    choices=['val_mae_epoch', 'val_loss_epoch'],
+    default='val_mae_epoch',
+    help='Metric used for best-checkpoint selection, early stopping, and LR scheduler monitoring.',
+)
+parser.add_argument(
+    '--monitor_mode',
+    choices=['min', 'max'],
+    default='min',
+    help="Optimization direction for --monitor_metric. Forecast errors should usually use 'min'.",
+)
+parser.add_argument('--loss', choices=['mae', 'huber'], default='huber')
+parser.add_argument('--huber_delta', type=float, default=3.0)
+parser.add_argument('--peak_anchor_loss_weight', type=float, default=1.0)
+parser.add_argument(
+    '--peak_anchor_hours',
+    default='6,12,16',
+    help='Comma-separated anchor hours that receive --peak_anchor_loss_weight during training only.',
+)
+parser.add_argument(
+    '--train_anchor_hours',
+    default='',
+    help='Optional comma-separated anchor hours kept in the training split. Validation/test remain unchanged.',
+)
+parser.add_argument('--mape_epsilon', type=float, default=1.0)
+parser.add_argument('--graph_sparsify_mode', choices=['none', 'topk', 'row_mean', 'topk_or_row_mean'], default='topk')
+parser.add_argument('--graph_topk', type=int, default=15)
+
+# Graph sparsification knobs. These are especially useful when comparing top-k style graph pruning variants.
+parser.add_argument(
+    '--graph_sparsify_symmetric',
+    default='true',
+    help="Use 'true' or 'false' to force the sparsified graph to be symmetric.",
+)
+parser.add_argument(
+    '--graph_sparsify_keep_self',
+    default='true',
+    help="Use 'true' or 'false' to keep self-loops after graph sparsification.",
+)
+parser.add_argument('--weekday_embed_dim', type=int, default=8)
+
+# Output non-negativity control for bike-count prediction heads.
+parser.add_argument(
+    '--output_constraint',
+    choices=['softplus', 'relu', 'none'],
+    default='softplus',
+    help="Post-process model outputs with 'softplus', 'relu', or no constraint.",
+)
+parser.add_argument(
+    '--output_softplus_beta',
+    type=float,
+    default=5.0,
+    help='Softplus sharpness used when --output_constraint=softplus. Larger means closer to ReLU.',
+)
+parser.add_argument('--graph_use', default='dist,neighb,distri,tempp,func')
+parser.add_argument(
+    '--hgaurban_graph_prior_path',
+    default='',
+    help='Optional path to hgaurban_graph_prior.npy. Required when --graph_use includes hgaurban unless the file is in graph_dir.',
+)
+parser.add_argument(
+    '--cssg_rw_graph_prior_path',
+    default='',
+    help='Optional path to cssg_rw_graph_prior.npy. Required when --graph_use includes cssg_rw unless the file is in graph_dir.',
+)
+parser.add_argument('--graph_attention', default='true', help="Use 'true' or 'false' to enable fusion-graph attention.")
+parser.add_argument('--matrix_weight', default='true', help="Use 'true' or 'false' to enable trainable graph-specific matrices.")
+parser.add_argument('--graph_fix_weight', default='false', help="Use 'true' or 'false' to freeze graph weights from prebuilt graphs.")
+parser.add_argument('--tempp_diag_zero', default='true', help="Use 'true' or 'false' to zero the diagonal of temporal proximity graph.")
+parser.add_argument('--context_gate', default='false', help="Use 'true' or 'false' to enable batch-level context-aware graph gating.")
+parser.add_argument('--context_gate_hidden_dim', type=int, default=32)
+parser.add_argument(
+    '--context_gate_residual',
+    type=float,
+    default=0.5,
+    help='Blend context graph weights with a uniform prior. For od_residual_correction, this controls how strongly OD multipliers stay near 1.',
+)
+parser.add_argument(
+    '--context_gate_anchor_hour',
+    default='false',
+    help="Use 'true' or 'false' to append anchor-hour embedding to the context graph gate.",
+)
+parser.add_argument(
+    '--context_gate_anchor_hour_index',
+    type=int,
+    default=-1,
+    help='Feature index for the hour column. -1 means infer from input_feature_cols.',
+)
+parser.add_argument('--context_gate_anchor_embed_dim', type=int, default=8)
+parser.add_argument(
+    '--context_gate_anchor_od_prior',
+    type=float,
+    default=0.0,
+    help='Add an anchor-specific logit prior to the matching OD graph before softmax. 0 disables it.',
+)
+parser.add_argument(
+    '--context_gate_scope',
+    choices=['all', 'od_only', 'od_residual_correction', 'hard_anchor_od'],
+    default='all',
+    help='Apply context gate to all graphs, redistribute OD graphs, softly correct OD graphs around the exp10 fusion prior, or hard-select the matching anchor-hour OD graph.',
+)
+parser.add_argument('--horizon_graph_fusion_gate', default='false', help="Use 'true' to enable anchor-hour and horizon-aware graph fusion gates.")
+parser.add_argument('--horizon_graph_hidden_dim', type=int, default=32)
+parser.add_argument('--horizon_graph_anchor_embed_dim', type=int, default=8)
+parser.add_argument('--horizon_graph_horizon_embed_dim', type=int, default=4)
+parser.add_argument(
+    '--horizon_graph_gate_residual',
+    type=float,
+    default=0.8,
+    help='Residual strength around the exp10 graph stack. 1.0 keeps exp10 graph fusion; 0.0 uses pure anchor-horizon gate.',
+)
+parser.add_argument('--state_graph_correction', default='false', help="Use 'true' to add a lightweight state-conditioned Top-k graph correction after graph fusion.")
+parser.add_argument(
+    '--state_graph_lambda',
+    type=float,
+    default=0.3,
+    help='Blend weight for state-conditioned graph correction: A_final=(1-lambda)A_prior+lambda*A_state.',
+)
+parser.add_argument('--state_graph_topk', type=int, default=20)
+parser.add_argument('--state_graph_embed_dim', type=int, default=16)
+parser.add_argument('--state_graph_hidden_dim', type=int, default=32)
+parser.add_argument('--state_graph_symmetric', default='false', help="Use 'true' to symmetrize the state-conditioned Top-k graph.")
+parser.add_argument('--state_graph_keep_self', default='true', help="Use 'true' to keep self loops in the state-conditioned graph.")
+parser.add_argument(
+    '--anchor_homogeneous_batches',
+    default='false',
+    help="Use 'true' to sample training batches from one anchor hour at a time.",
+)
+parser.add_argument('--graph_distri_type', default='exp')
+parser.add_argument('--graph_func_type', default='ours')
+parser.add_argument('--fusion_heads', type=int, default=24)
+parser.add_argument('--fusion_head_dim', type=int, default=6)
+parser.add_argument('--bn_decay', type=float, default=0.1)
+parser.add_argument(
+    '--model_use',
+    choices=['MSTGCN', 'D2STGNN'],
+    default='MSTGCN',
+    help='Backbone after FusionGraphModel. Default keeps the original MSTGCN mainline.',
+)
+parser.add_argument('--cheb_k', type=int, default=3)
+parser.add_argument('--nb_block', type=int, default=2)
+parser.add_argument('--nb_chev_filter', type=int, default=64)
+parser.add_argument('--nb_time_filter', type=int, default=64)
+parser.add_argument(
+    '--time_kernel_size',
+    type=int,
+    default=3,
+    help='Temporal convolution kernel size inside MSTGCN blocks. Must be an odd number such as 3, 5, or 7.',
+)
+parser.add_argument('--channel_attention', default='false', help="Use 'true' or 'false' to enable channel attention in MSTGCN.")
+parser.add_argument('--channel_attention_reduction', type=int, default=4)
+parser.add_argument('--trend_alignment_decoder', default='false', help="Use 'true' or 'false' to enable the TSTAD-style trend-alignment parallel decoder.")
+parser.add_argument('--trend_time_feature_index', type=int, default=-1, help='Feature index for intra-day time ids. -1 means infer from input_feature_cols.')
+parser.add_argument('--trend_time_cycle', type=int, default=24, help='Number of intra-day slots, e.g. 24 for hourly or 48 for half-hourly data.')
+parser.add_argument('--trend_time_embed_dim', type=int, default=16)
+parser.add_argument('--trend_attention_heads', type=int, default=4)
+parser.add_argument('--trend_dropout', type=float, default=0.1)
+parser.add_argument(
+    '--horizon_specific_prediction_head',
+    default='false',
+    help="Use 'true' to replace the shared final prediction head with one output head per horizon.",
+)
+parser.add_argument(
+    '--horizon_graph_fusion_decoder',
+    default='false',
+    help="Use 'true' to decode each horizon from an anchor-horizon gated fusion graph.",
+)
+parser.add_argument(
+    '--horizon_graph_decoder_residual',
+    type=float,
+    default=0.2,
+    help='Feature blend strength for horizon graph decoder. 0 keeps the exp10 hidden state; 1 uses only graph-propagated hidden state.',
+)
+parser.add_argument('--ast_tcn_residual', default='false', help="Use 'true' or 'false' to add an AST-TCN-inspired residual branch to MSTGCN.")
+parser.add_argument('--ast_tcn_hidden_dim', type=int, default=32)
+parser.add_argument('--ast_tcn_layers', type=int, default=4)
+parser.add_argument('--ast_tcn_kernel_size', type=int, default=3)
+parser.add_argument('--ast_tcn_dilation_base', type=int, default=2)
+parser.add_argument('--ast_tcn_heads', type=int, default=4)
+parser.add_argument('--ast_tcn_dropout', type=float, default=0.1)
+parser.add_argument('--ast_tcn_residual_init', type=float, default=0.05)
+parser.add_argument('--ast_tcn_bounded_alpha', default='false', help="Use 'true' or 'false' to bound the AST-TCN residual scale.")
+parser.add_argument('--ast_tcn_alpha_max', type=float, default=0.1)
+parser.add_argument('--ast_tcn_horizon_alpha', default='false', help="Use 'true' or 'false' to learn one AST-TCN residual alpha per prediction horizon.")
+parser.add_argument('--ast_tcn_residual_horizon_mask', default='', help="Comma-separated fixed AST-TCN residual mask per horizon, e.g. '1,0,1' for pred_len=3.")
+parser.add_argument('--ast_tcn_zero_init', default='false', help="Use 'true' or 'false' to zero-init the AST-TCN residual output head.")
+parser.add_argument('--ast_tcn_residual_gate', default='false', help="Use 'true' or 'false' to learn a dynamic gate for the AST-TCN residual branch.")
+parser.add_argument('--ast_tcn_residual_gate_hidden_dim', type=int, default=16)
+parser.add_argument('--ast_tcn_residual_gate_init', type=float, default=0.2)
+parser.add_argument('--ast_tcn_anchor_horizon_gate', default='false', help="Use 'true' or 'false' to gate AST-TCN residuals by anchor hour, horizon, and pooled state.")
+parser.add_argument('--ast_tcn_anchor_embed_dim', type=int, default=8)
+parser.add_argument('--ast_tcn_horizon_embed_dim', type=int, default=4)
+parser.add_argument('--ast_tcn_anchor_horizon_gate_hidden_dim', type=int, default=16)
+parser.add_argument('--ast_tcn_anchor_horizon_gate_init', type=float, default=0.2)
+parser.add_argument('--ast_tcn_edge_bias', default='false', help="Use 'true' or 'false' to add fused-graph edge weights as spatial-attention score bias.")
+parser.add_argument('--ast_tcn_edge_bias_init', type=float, default=0.1)
+parser.add_argument('--ast_tcn_hgaurban_edge_bias', default='false', help="Use 'true' or 'false' to add HGAurban prior as an extra AST-TCN spatial-attention edge bias without adding it to graph fusion.")
+parser.add_argument('--ast_tcn_hgaurban_edge_bias_init', type=float, default=0.03)
+parser.add_argument('--ast_tcn_edge_bias_eps', type=float, default=1e-6)
+parser.add_argument('--sthybrid_ms_residual', default='false', help="Use 'true' or 'false' to add a ST-Hybrid-style multi-scale temporal residual branch.")
+parser.add_argument('--sthybrid_ms_hidden_dim', type=int, default=32)
+parser.add_argument('--sthybrid_ms_dilations', default='1,2,4,8', help="Comma-separated dilation set for the ST-Hybrid multi-scale branch.")
+parser.add_argument('--sthybrid_ms_kernel_size', type=int, default=3)
+parser.add_argument('--sthybrid_ms_heads', type=int, default=4)
+parser.add_argument('--sthybrid_ms_dropout', type=float, default=0.1)
+parser.add_argument('--sthybrid_ms_residual_init', type=float, default=0.01)
+parser.add_argument('--sthybrid_ms_bounded_alpha', default='true', help="Use 'true' or 'false' to bound the ST-Hybrid residual scale.")
+parser.add_argument('--sthybrid_ms_alpha_max', type=float, default=0.1)
+parser.add_argument('--sthybrid_ms_zero_init', default='true', help="Use 'true' or 'false' to zero-init the ST-Hybrid residual output head.")
+parser.add_argument('--sthybrid_ms_edge_bias', default='true', help="Use 'true' or 'false' to add fused-graph edge bias to the ST-Hybrid spatial attention.")
+parser.add_argument('--sthybrid_ms_edge_bias_init', type=float, default=0.05)
+parser.add_argument('--sthybrid_ms_edge_bias_eps', type=float, default=1e-6)
+parser.add_argument('--stgformer_temporal_residual', default='false', help="Use 'true' or 'false' to add a STGformer-style local-global temporal residual branch.")
+parser.add_argument('--stgformer_temporal_hidden_dim', type=int, default=32)
+parser.add_argument('--stgformer_temporal_heads', type=int, default=4)
+parser.add_argument('--stgformer_temporal_local_kernel_size', type=int, default=5)
+parser.add_argument('--stgformer_temporal_landmark_count', type=int, default=24)
+parser.add_argument('--stgformer_temporal_dropout', type=float, default=0.1)
+parser.add_argument('--stgformer_temporal_residual_init', type=float, default=0.01)
+parser.add_argument('--stgformer_temporal_bounded_alpha', default='true', help="Use 'true' or 'false' to bound the STGformer temporal residual scale.")
+parser.add_argument('--stgformer_temporal_alpha_max', type=float, default=0.1)
+parser.add_argument('--stgformer_temporal_zero_init', default='true', help="Use 'true' or 'false' to zero-init the STGformer temporal residual output head.")
+parser.add_argument('--stgformer_temporal_gate_init', type=float, default=0.2)
+parser.add_argument('--stgformer_spatial_transformer', default='false', help="Use 'true' to add graph-aware spatial transformer after the STGformer-style temporal encoder.")
+parser.add_argument('--stgformer_spatial_heads', type=int, default=4)
+parser.add_argument('--stgformer_spatial_edge_bias', default='true', help="Use 'true' to add fused-graph edge weights as spatial-attention score bias in the STGformer branch.")
+parser.add_argument('--stgformer_spatial_edge_bias_init', type=float, default=0.05)
+parser.add_argument('--stgformer_spatial_edge_bias_eps', type=float, default=1e-6)
+parser.add_argument('--d2_hidden_dim', type=int, default=64)
+parser.add_argument('--d2_num_layers', type=int, default=4)
+parser.add_argument('--d2_dropout', type=float, default=0.1)
+parser.add_argument('--d2_dilation_cycle', type=int, default=2)
+parser.add_argument('--d2_kernel_size', type=int, default=2)
+parser.add_argument('--d2_gcn_order', type=int, default=2)
+parser.add_argument('--d2_node_embed_dim', type=int, default=16)
+parser.add_argument('--d2_adaptive_adj', default='true', help="Use 'true' or 'false' to blend fused graph with adaptive adjacency.")
+parser.add_argument('--d2_use_reverse', default='true', help="Use 'true' or 'false' to include reverse diffusion support.")
+parser.add_argument('--d2_fusion_init', type=float, default=1.0, help='Initial fused-graph logit for D2STGNN graph blending.')
+args = parser.parse_args()
+
+
+def parse_bool_arg(value, flag_name):
+    normalized = str(value).strip().lower()
+    mapping = {
+        '1': True,
+        'true': True,
+        'yes': True,
+        'y': True,
+        '0': False,
+        'false': False,
+        'no': False,
+        'n': False,
+    }
+    if normalized not in mapping:
+        parser.error('%s only accepts true/false/1/0/yes/no, got: %s' % (flag_name, value))
+    return mapping[normalized]
+
+
+def parse_graph_use_arg(value):
+    graph_use = [item.strip() for item in str(value).split(',') if item.strip()]
+    if not graph_use:
+        parser.error('--graph_use must include at least one graph name.')
+    allowed_graphs = {
+        'dist',
+        'neighb',
+        'distri',
+        'tempp',
+        'func',
+        'od00',
+        'od03',
+        'od06',
+        'od09',
+        'od12',
+        'od15',
+        'od16',
+        'od18',
+        'od20',
+        'od21',
+        'hgaurban',
+        'cssg_rw',
+    }
+    unknown_graphs = [item for item in graph_use if item not in allowed_graphs]
+    if unknown_graphs:
+        parser.error('Unsupported graph names in --graph_use: %s' % ', '.join(unknown_graphs))
+    return graph_use
+
+
+def parse_anchor_hour_list(value):
+    if value is None or str(value).strip() == '':
+        return []
+    hours = []
+    for item in str(value).split(','):
+        item = item.strip()
+        if not item:
+            continue
+        hour = int(item)
+        if hour < 0 or hour > 23:
+            parser.error('anchor hour values must be within [0, 23].')
+        hours.append(hour)
+    return hours
+
+
+def parse_float_list(value, flag_name):
+    if value is None or str(value).strip() == '':
+        return []
+    values = []
+    for item in str(value).split(','):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            values.append(float(item))
+        except ValueError:
+            parser.error('%s only accepts comma-separated numbers, got: %s' % (flag_name, item))
+    return values
+
+
+def parse_int_list(value, flag_name):
+    if value is None or str(value).strip() == '':
+        return []
+    values = []
+    for item in str(value).split(','):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            values.append(int(item))
+        except ValueError:
+            parser.error('%s only accepts comma-separated integers, got: %s' % (flag_name, item))
+    return values
+
+
+args.graph_attention = parse_bool_arg(args.graph_attention, '--graph_attention')
+args.matrix_weight = parse_bool_arg(args.matrix_weight, '--matrix_weight')
+args.graph_fix_weight = parse_bool_arg(args.graph_fix_weight, '--graph_fix_weight')
+args.tempp_diag_zero = parse_bool_arg(args.tempp_diag_zero, '--tempp_diag_zero')
+args.graph_sparsify_symmetric = parse_bool_arg(args.graph_sparsify_symmetric, '--graph_sparsify_symmetric')
+args.graph_sparsify_keep_self = parse_bool_arg(args.graph_sparsify_keep_self, '--graph_sparsify_keep_self')
+args.context_gate = parse_bool_arg(args.context_gate, '--context_gate')
+args.context_gate_anchor_hour = parse_bool_arg(args.context_gate_anchor_hour, '--context_gate_anchor_hour')
+args.horizon_graph_fusion_gate = parse_bool_arg(args.horizon_graph_fusion_gate, '--horizon_graph_fusion_gate')
+args.state_graph_correction = parse_bool_arg(args.state_graph_correction, '--state_graph_correction')
+args.state_graph_symmetric = parse_bool_arg(args.state_graph_symmetric, '--state_graph_symmetric')
+args.state_graph_keep_self = parse_bool_arg(args.state_graph_keep_self, '--state_graph_keep_self')
+args.anchor_homogeneous_batches = parse_bool_arg(args.anchor_homogeneous_batches, '--anchor_homogeneous_batches')
+args.freeze_non_ast_tcn = parse_bool_arg(args.freeze_non_ast_tcn, '--freeze_non_ast_tcn')
+args.trend_alignment_decoder = parse_bool_arg(args.trend_alignment_decoder, '--trend_alignment_decoder')
+args.horizon_specific_prediction_head = parse_bool_arg(
+    args.horizon_specific_prediction_head,
+    '--horizon_specific_prediction_head',
+)
+args.horizon_graph_fusion_decoder = parse_bool_arg(
+    args.horizon_graph_fusion_decoder,
+    '--horizon_graph_fusion_decoder',
+)
+args.ast_tcn_residual = parse_bool_arg(args.ast_tcn_residual, '--ast_tcn_residual')
+args.ast_tcn_bounded_alpha = parse_bool_arg(args.ast_tcn_bounded_alpha, '--ast_tcn_bounded_alpha')
+args.ast_tcn_horizon_alpha = parse_bool_arg(args.ast_tcn_horizon_alpha, '--ast_tcn_horizon_alpha')
+args.ast_tcn_zero_init = parse_bool_arg(args.ast_tcn_zero_init, '--ast_tcn_zero_init')
+args.ast_tcn_residual_gate = parse_bool_arg(args.ast_tcn_residual_gate, '--ast_tcn_residual_gate')
+args.ast_tcn_anchor_horizon_gate = parse_bool_arg(args.ast_tcn_anchor_horizon_gate, '--ast_tcn_anchor_horizon_gate')
+args.ast_tcn_edge_bias = parse_bool_arg(args.ast_tcn_edge_bias, '--ast_tcn_edge_bias')
+args.ast_tcn_hgaurban_edge_bias = parse_bool_arg(args.ast_tcn_hgaurban_edge_bias, '--ast_tcn_hgaurban_edge_bias')
+args.sthybrid_ms_residual = parse_bool_arg(args.sthybrid_ms_residual, '--sthybrid_ms_residual')
+args.sthybrid_ms_bounded_alpha = parse_bool_arg(args.sthybrid_ms_bounded_alpha, '--sthybrid_ms_bounded_alpha')
+args.sthybrid_ms_zero_init = parse_bool_arg(args.sthybrid_ms_zero_init, '--sthybrid_ms_zero_init')
+args.sthybrid_ms_edge_bias = parse_bool_arg(args.sthybrid_ms_edge_bias, '--sthybrid_ms_edge_bias')
+args.stgformer_temporal_residual = parse_bool_arg(args.stgformer_temporal_residual, '--stgformer_temporal_residual')
+args.stgformer_temporal_bounded_alpha = parse_bool_arg(
+    args.stgformer_temporal_bounded_alpha,
+    '--stgformer_temporal_bounded_alpha',
+)
+args.stgformer_temporal_zero_init = parse_bool_arg(
+    args.stgformer_temporal_zero_init,
+    '--stgformer_temporal_zero_init',
+)
+args.stgformer_spatial_transformer = parse_bool_arg(args.stgformer_spatial_transformer, '--stgformer_spatial_transformer')
+args.stgformer_spatial_edge_bias = parse_bool_arg(args.stgformer_spatial_edge_bias, '--stgformer_spatial_edge_bias')
+args.save_checkpoints = parse_bool_arg(args.save_checkpoints, '--save_checkpoints')
+args.channel_attention = parse_bool_arg(args.channel_attention, '--channel_attention')
+args.d2_adaptive_adj = parse_bool_arg(args.d2_adaptive_adj, '--d2_adaptive_adj')
+args.d2_use_reverse = parse_bool_arg(args.d2_use_reverse, '--d2_use_reverse')
+args.graph_use = parse_graph_use_arg(args.graph_use)
+args.peak_anchor_hours = parse_anchor_hour_list(args.peak_anchor_hours)
+args.train_anchor_hours = parse_anchor_hour_list(args.train_anchor_hours)
+args.ast_tcn_residual_horizon_mask = parse_float_list(
+    args.ast_tcn_residual_horizon_mask,
+    '--ast_tcn_residual_horizon_mask',
+)
+args.sthybrid_ms_dilations = parse_int_list(args.sthybrid_ms_dilations, '--sthybrid_ms_dilations')
+
+if args.graph_topk < 0:
+    parser.error('--graph_topk must be >= 0.')
+if args.num_workers < 0:
+    parser.error('--num_workers must be >= 0.')
+if args.limit_train_batches is not None and args.limit_train_batches <= 0:
+    parser.error('--limit_train_batches must be > 0.')
+if args.limit_val_batches is not None and args.limit_val_batches <= 0:
+    parser.error('--limit_val_batches must be > 0.')
+if args.limit_test_batches is not None and args.limit_test_batches <= 0:
+    parser.error('--limit_test_batches must be > 0.')
+if args.num_sanity_val_steps < 0:
+    parser.error('--num_sanity_val_steps must be >= 0.')
+if args.weekday_embed_dim < 0:
+    parser.error('--weekday_embed_dim must be >= 0.')
+if args.peak_anchor_loss_weight <= 0:
+    parser.error('--peak_anchor_loss_weight must be > 0.')
+if args.peak_anchor_loss_weight != 1.0 and not args.peak_anchor_hours:
+    parser.error('--peak_anchor_loss_weight requires at least one --peak_anchor_hours value.')
+if args.context_gate_hidden_dim <= 0:
+    parser.error('--context_gate_hidden_dim must be > 0.')
+if not (0.0 <= args.context_gate_residual <= 1.0):
+    parser.error('--context_gate_residual must be within [0, 1].')
+if args.context_gate_anchor_embed_dim <= 0:
+    parser.error('--context_gate_anchor_embed_dim must be > 0.')
+if args.context_gate_anchor_hour and not args.context_gate:
+    parser.error('--context_gate_anchor_hour requires --context_gate true.')
+if args.context_gate_anchor_od_prior < 0:
+    parser.error('--context_gate_anchor_od_prior must be >= 0.')
+if args.horizon_graph_hidden_dim <= 0:
+    parser.error('--horizon_graph_hidden_dim must be > 0.')
+if args.horizon_graph_anchor_embed_dim <= 0:
+    parser.error('--horizon_graph_anchor_embed_dim must be > 0.')
+if args.horizon_graph_horizon_embed_dim <= 0:
+    parser.error('--horizon_graph_horizon_embed_dim must be > 0.')
+if not (0.0 <= args.horizon_graph_gate_residual <= 1.0):
+    parser.error('--horizon_graph_gate_residual must be within [0, 1].')
+if args.horizon_graph_fusion_decoder and not args.horizon_graph_fusion_gate:
+    parser.error('--horizon_graph_fusion_decoder requires --horizon_graph_fusion_gate true.')
+if not (0.0 <= args.state_graph_lambda <= 1.0):
+    parser.error('--state_graph_lambda must be within [0, 1].')
+if args.state_graph_topk < 0:
+    parser.error('--state_graph_topk must be >= 0.')
+if args.state_graph_embed_dim <= 0:
+    parser.error('--state_graph_embed_dim must be > 0.')
+if args.state_graph_hidden_dim <= 0:
+    parser.error('--state_graph_hidden_dim must be > 0.')
+if args.context_gate_scope == 'hard_anchor_od' and not args.context_gate:
+    parser.error('--context_gate_scope hard_anchor_od requires --context_gate true.')
+if args.context_gate_scope == 'hard_anchor_od' and not args.context_gate_anchor_hour:
+    parser.error('--context_gate_scope hard_anchor_od requires --context_gate_anchor_hour true.')
+if args.context_gate_scope == 'hard_anchor_od' and not args.anchor_homogeneous_batches:
+    parser.error('--context_gate_scope hard_anchor_od requires --anchor_homogeneous_batches true for batch-level Cheb graphs.')
+if args.anchor_homogeneous_batches and not (
+    args.context_gate_anchor_hour
+    or args.horizon_graph_fusion_gate
+):
+    parser.error('--anchor_homogeneous_batches is intended for --context_gate_anchor_hour true or --horizon_graph_fusion_gate true.')
+if args.trend_time_cycle <= 0:
+    parser.error('--trend_time_cycle must be > 0.')
+if args.trend_time_embed_dim <= 0:
+    parser.error('--trend_time_embed_dim must be > 0.')
+if args.trend_attention_heads <= 0:
+    parser.error('--trend_attention_heads must be > 0.')
+if args.trend_alignment_decoder and args.horizon_specific_prediction_head:
+    parser.error('--horizon_specific_prediction_head is only supported with the standard final prediction head, not --trend_alignment_decoder.')
+if args.trend_alignment_decoder and args.horizon_graph_fusion_decoder:
+    parser.error('--horizon_graph_fusion_decoder is only supported with the standard final prediction head, not --trend_alignment_decoder.')
+if args.horizon_specific_prediction_head and args.horizon_graph_fusion_decoder:
+    parser.error('--horizon_graph_fusion_decoder uses the shared final head and cannot be combined with --horizon_specific_prediction_head.')
+if not (0.0 <= args.horizon_graph_decoder_residual <= 1.0):
+    parser.error('--horizon_graph_decoder_residual must be within [0, 1].')
+if args.ast_tcn_hidden_dim <= 0:
+    parser.error('--ast_tcn_hidden_dim must be > 0.')
+if args.ast_tcn_layers <= 0:
+    parser.error('--ast_tcn_layers must be > 0.')
+if args.ast_tcn_kernel_size <= 0:
+    parser.error('--ast_tcn_kernel_size must be > 0.')
+if args.ast_tcn_dilation_base <= 0:
+    parser.error('--ast_tcn_dilation_base must be > 0.')
+if args.ast_tcn_heads <= 0:
+    parser.error('--ast_tcn_heads must be > 0.')
+if args.ast_tcn_dropout < 0:
+    parser.error('--ast_tcn_dropout must be >= 0.')
+if args.ast_tcn_alpha_max <= 0:
+    parser.error('--ast_tcn_alpha_max must be > 0.')
+if args.ast_tcn_bounded_alpha and not (0.0 <= args.ast_tcn_residual_init <= args.ast_tcn_alpha_max):
+    parser.error('--ast_tcn_residual_init must be within [0, --ast_tcn_alpha_max] when --ast_tcn_bounded_alpha true.')
+if args.ast_tcn_residual_horizon_mask and len(args.ast_tcn_residual_horizon_mask) != args.pred_len:
+    parser.error('--ast_tcn_residual_horizon_mask length must match --pred_len.')
+if args.freeze_non_ast_tcn and not args.ast_tcn_residual:
+    parser.error('--freeze_non_ast_tcn requires --ast_tcn_residual true.')
+if args.ast_tcn_residual_gate_hidden_dim <= 0:
+    parser.error('--ast_tcn_residual_gate_hidden_dim must be > 0.')
+if not (0.0 < args.ast_tcn_residual_gate_init < 1.0):
+    parser.error('--ast_tcn_residual_gate_init must be within (0, 1).')
+if args.ast_tcn_anchor_horizon_gate and not args.ast_tcn_residual:
+    parser.error('--ast_tcn_anchor_horizon_gate requires --ast_tcn_residual true.')
+if args.ast_tcn_anchor_embed_dim <= 0:
+    parser.error('--ast_tcn_anchor_embed_dim must be > 0.')
+if args.ast_tcn_horizon_embed_dim <= 0:
+    parser.error('--ast_tcn_horizon_embed_dim must be > 0.')
+if args.ast_tcn_anchor_horizon_gate_hidden_dim <= 0:
+    parser.error('--ast_tcn_anchor_horizon_gate_hidden_dim must be > 0.')
+if not (0.0 < args.ast_tcn_anchor_horizon_gate_init < 1.0):
+    parser.error('--ast_tcn_anchor_horizon_gate_init must be within (0, 1).')
+if args.ast_tcn_edge_bias_init < 0:
+    parser.error('--ast_tcn_edge_bias_init must be >= 0.')
+if args.ast_tcn_hgaurban_edge_bias and not args.ast_tcn_residual:
+    parser.error('--ast_tcn_hgaurban_edge_bias requires --ast_tcn_residual true.')
+if args.ast_tcn_hgaurban_edge_bias_init < 0:
+    parser.error('--ast_tcn_hgaurban_edge_bias_init must be >= 0.')
+if args.ast_tcn_edge_bias_eps <= 0:
+    parser.error('--ast_tcn_edge_bias_eps must be > 0.')
+if args.sthybrid_ms_hidden_dim <= 0:
+    parser.error('--sthybrid_ms_hidden_dim must be > 0.')
+if not args.sthybrid_ms_dilations:
+    parser.error('--sthybrid_ms_dilations must include at least one dilation.')
+if any(dilation <= 0 for dilation in args.sthybrid_ms_dilations):
+    parser.error('--sthybrid_ms_dilations values must be > 0.')
+if args.sthybrid_ms_kernel_size <= 0:
+    parser.error('--sthybrid_ms_kernel_size must be > 0.')
+if args.sthybrid_ms_heads <= 0:
+    parser.error('--sthybrid_ms_heads must be > 0.')
+if args.sthybrid_ms_dropout < 0:
+    parser.error('--sthybrid_ms_dropout must be >= 0.')
+if args.sthybrid_ms_alpha_max <= 0:
+    parser.error('--sthybrid_ms_alpha_max must be > 0.')
+if args.sthybrid_ms_bounded_alpha and not (0.0 <= args.sthybrid_ms_residual_init <= args.sthybrid_ms_alpha_max):
+    parser.error('--sthybrid_ms_residual_init must be within [0, --sthybrid_ms_alpha_max] when --sthybrid_ms_bounded_alpha true.')
+if args.sthybrid_ms_edge_bias_init < 0:
+    parser.error('--sthybrid_ms_edge_bias_init must be >= 0.')
+if args.sthybrid_ms_edge_bias_eps <= 0:
+    parser.error('--sthybrid_ms_edge_bias_eps must be > 0.')
+if args.stgformer_temporal_hidden_dim <= 0:
+    parser.error('--stgformer_temporal_hidden_dim must be > 0.')
+if args.stgformer_temporal_heads <= 0:
+    parser.error('--stgformer_temporal_heads must be > 0.')
+if args.stgformer_temporal_local_kernel_size <= 0:
+    parser.error('--stgformer_temporal_local_kernel_size must be > 0.')
+if args.stgformer_temporal_landmark_count <= 0:
+    parser.error('--stgformer_temporal_landmark_count must be > 0.')
+if args.stgformer_temporal_dropout < 0:
+    parser.error('--stgformer_temporal_dropout must be >= 0.')
+if args.stgformer_temporal_alpha_max <= 0:
+    parser.error('--stgformer_temporal_alpha_max must be > 0.')
+if args.stgformer_temporal_bounded_alpha and not (
+    0.0 <= args.stgformer_temporal_residual_init <= args.stgformer_temporal_alpha_max
+):
+    parser.error('--stgformer_temporal_residual_init must be within [0, --stgformer_temporal_alpha_max] when --stgformer_temporal_bounded_alpha true.')
+if not (0.0 < args.stgformer_temporal_gate_init < 1.0):
+    parser.error('--stgformer_temporal_gate_init must be within (0, 1).')
+if args.stgformer_spatial_transformer and not args.stgformer_temporal_residual:
+    parser.error('--stgformer_spatial_transformer requires --stgformer_temporal_residual true.')
+if args.stgformer_spatial_heads <= 0:
+    parser.error('--stgformer_spatial_heads must be > 0.')
+if args.stgformer_spatial_edge_bias_init < 0:
+    parser.error('--stgformer_spatial_edge_bias_init must be >= 0.')
+if args.stgformer_spatial_edge_bias_eps <= 0:
+    parser.error('--stgformer_spatial_edge_bias_eps must be > 0.')
+if args.sthybrid_ms_residual and (args.ast_tcn_residual or args.stgformer_temporal_residual):
+    parser.error('Do not combine --sthybrid_ms_residual with AST-TCN or STGformer temporal residual branches.')
+if args.fusion_heads <= 0:
+    parser.error('--fusion_heads must be > 0.')
+if args.fusion_head_dim <= 0:
+    parser.error('--fusion_head_dim must be > 0.')
+if args.bn_decay <= 0:
+    parser.error('--bn_decay must be > 0.')
+if args.cheb_k <= 0:
+    parser.error('--cheb_k must be > 0.')
+if args.nb_block <= 0:
+    parser.error('--nb_block must be > 0.')
+if args.nb_chev_filter <= 0:
+    parser.error('--nb_chev_filter must be > 0.')
+if args.nb_time_filter <= 0:
+    parser.error('--nb_time_filter must be > 0.')
+if args.time_kernel_size <= 0:
+    parser.error('--time_kernel_size must be > 0.')
+if args.time_kernel_size % 2 == 0:
+    parser.error('--time_kernel_size must be an odd number so time padding stays centered.')
+if args.channel_attention_reduction <= 0:
+    parser.error('--channel_attention_reduction must be > 0.')
+if args.d2_hidden_dim <= 0:
+    parser.error('--d2_hidden_dim must be > 0.')
+if args.d2_num_layers <= 0:
+    parser.error('--d2_num_layers must be > 0.')
+if args.d2_dropout < 0:
+    parser.error('--d2_dropout must be >= 0.')
+if args.d2_dilation_cycle <= 0:
+    parser.error('--d2_dilation_cycle must be > 0.')
+if args.d2_kernel_size <= 0:
+    parser.error('--d2_kernel_size must be > 0.')
+if args.d2_gcn_order <= 0:
+    parser.error('--d2_gcn_order must be > 0.')
+if args.d2_node_embed_dim <= 0:
+    parser.error('--d2_node_embed_dim must be > 0.')
+if args.output_softplus_beta <= 0:
+    parser.error('--output_softplus_beta must be > 0.')
+if args.grad_clip_val < 0:
+    parser.error('--grad_clip_val must be >= 0.')
+
+
+def parse_precision_arg(value):
+    normalized = str(value).strip().lower()
+    precision_map = {
+        '16': 16,
+        '32': 32,
+        '64': 64,
+        '16-mixed': '16-mixed',
+        'bf16-mixed': 'bf16-mixed',
+        'bf16': 'bf16',
+        '32-true': '32-true',
+        '64-true': '64-true',
+    }
+    if normalized not in precision_map:
+        parser.error("--precision must be one of: 16, 32, 64, 16-mixed, bf16-mixed, bf16, 32-true, 64-true")
+    return precision_map[normalized]
+
+
+args.precision = parse_precision_arg(args.precision)
+
+if args.logger == 'wandb':
+    os.environ['WANDB_MODE'] = 'online'
+elif args.logger == 'csv':
+    os.environ.setdefault('WANDB_MODE', 'disabled')
+
+hyperparameter_defaults = dict(
+    server=dict(
+        gpu_id=0,
+    ),
+    graph=dict(
+        use=args.graph_use,
+        fix_weight=args.graph_fix_weight,
+        tempp_diag_zero=args.tempp_diag_zero,
+        matrix_weight=args.matrix_weight,
+        context_gate=args.context_gate,
+        context_gate_hidden_dim=args.context_gate_hidden_dim,
+        context_gate_residual=args.context_gate_residual,
+        context_gate_anchor_hour=args.context_gate_anchor_hour,
+        context_gate_anchor_hour_index=args.context_gate_anchor_hour_index,
+        context_gate_anchor_embed_dim=args.context_gate_anchor_embed_dim,
+        context_gate_anchor_od_prior=args.context_gate_anchor_od_prior,
+        context_gate_scope=args.context_gate_scope,
+        horizon_graph_fusion_gate=args.horizon_graph_fusion_gate,
+        horizon_graph_hidden_dim=args.horizon_graph_hidden_dim,
+        horizon_graph_anchor_embed_dim=args.horizon_graph_anchor_embed_dim,
+        horizon_graph_horizon_embed_dim=args.horizon_graph_horizon_embed_dim,
+        horizon_graph_gate_residual=args.horizon_graph_gate_residual,
+        state_graph_correction=args.state_graph_correction,
+        state_graph_lambda=args.state_graph_lambda,
+        state_graph_topk=args.state_graph_topk,
+        state_graph_embed_dim=args.state_graph_embed_dim,
+        state_graph_hidden_dim=args.state_graph_hidden_dim,
+        state_graph_symmetric=args.state_graph_symmetric,
+        state_graph_keep_self=args.state_graph_keep_self,
+        hgaurban_graph_prior_path=args.hgaurban_graph_prior_path,
+        cssg_rw_graph_prior_path=args.cssg_rw_graph_prior_path,
+        distri_type=args.graph_distri_type,
+        func_type=args.graph_func_type,
+        attention=args.graph_attention,
+        sparsify_mode=args.graph_sparsify_mode,
+        sparsify_topk=args.graph_topk,
+        sparsify_symmetric=args.graph_sparsify_symmetric,
+        sparsify_keep_self=args.graph_sparsify_keep_self,
+    ),
+    model=dict(
+        use=args.model_use,
+        cheb_k=args.cheb_k,
+        nb_block=args.nb_block,
+        nb_chev_filter=args.nb_chev_filter,
+        nb_time_filter=args.nb_time_filter,
+        time_kernel_size=args.time_kernel_size,
+        channel_attention=args.channel_attention,
+        channel_attention_reduction=args.channel_attention_reduction,
+        trend_alignment_decoder=args.trend_alignment_decoder,
+        trend_time_feature_index=args.trend_time_feature_index,
+        trend_time_cycle=args.trend_time_cycle,
+        trend_time_embed_dim=args.trend_time_embed_dim,
+        trend_attention_heads=args.trend_attention_heads,
+        trend_dropout=args.trend_dropout,
+        horizon_specific_prediction_head=args.horizon_specific_prediction_head,
+        horizon_graph_fusion_decoder=args.horizon_graph_fusion_decoder,
+        horizon_graph_decoder_residual=args.horizon_graph_decoder_residual,
+        ast_tcn_residual=args.ast_tcn_residual,
+        ast_tcn_hidden_dim=args.ast_tcn_hidden_dim,
+        ast_tcn_layers=args.ast_tcn_layers,
+        ast_tcn_kernel_size=args.ast_tcn_kernel_size,
+        ast_tcn_dilation_base=args.ast_tcn_dilation_base,
+        ast_tcn_heads=args.ast_tcn_heads,
+        ast_tcn_dropout=args.ast_tcn_dropout,
+        ast_tcn_residual_init=args.ast_tcn_residual_init,
+        ast_tcn_bounded_alpha=args.ast_tcn_bounded_alpha,
+        ast_tcn_alpha_max=args.ast_tcn_alpha_max,
+        ast_tcn_horizon_alpha=args.ast_tcn_horizon_alpha,
+        ast_tcn_residual_horizon_mask=args.ast_tcn_residual_horizon_mask,
+        ast_tcn_zero_init=args.ast_tcn_zero_init,
+        ast_tcn_residual_gate=args.ast_tcn_residual_gate,
+        ast_tcn_residual_gate_hidden_dim=args.ast_tcn_residual_gate_hidden_dim,
+        ast_tcn_residual_gate_init=args.ast_tcn_residual_gate_init,
+        ast_tcn_anchor_horizon_gate=args.ast_tcn_anchor_horizon_gate,
+        ast_tcn_anchor_embed_dim=args.ast_tcn_anchor_embed_dim,
+        ast_tcn_horizon_embed_dim=args.ast_tcn_horizon_embed_dim,
+        ast_tcn_anchor_horizon_gate_hidden_dim=args.ast_tcn_anchor_horizon_gate_hidden_dim,
+        ast_tcn_anchor_horizon_gate_init=args.ast_tcn_anchor_horizon_gate_init,
+        ast_tcn_edge_bias=args.ast_tcn_edge_bias,
+        ast_tcn_edge_bias_init=args.ast_tcn_edge_bias_init,
+        ast_tcn_hgaurban_edge_bias=args.ast_tcn_hgaurban_edge_bias,
+        ast_tcn_hgaurban_edge_bias_init=args.ast_tcn_hgaurban_edge_bias_init,
+        ast_tcn_edge_bias_eps=args.ast_tcn_edge_bias_eps,
+        sthybrid_ms_residual=args.sthybrid_ms_residual,
+        sthybrid_ms_hidden_dim=args.sthybrid_ms_hidden_dim,
+        sthybrid_ms_dilations=args.sthybrid_ms_dilations,
+        sthybrid_ms_kernel_size=args.sthybrid_ms_kernel_size,
+        sthybrid_ms_heads=args.sthybrid_ms_heads,
+        sthybrid_ms_dropout=args.sthybrid_ms_dropout,
+        sthybrid_ms_residual_init=args.sthybrid_ms_residual_init,
+        sthybrid_ms_bounded_alpha=args.sthybrid_ms_bounded_alpha,
+        sthybrid_ms_alpha_max=args.sthybrid_ms_alpha_max,
+        sthybrid_ms_zero_init=args.sthybrid_ms_zero_init,
+        sthybrid_ms_edge_bias=args.sthybrid_ms_edge_bias,
+        sthybrid_ms_edge_bias_init=args.sthybrid_ms_edge_bias_init,
+        sthybrid_ms_edge_bias_eps=args.sthybrid_ms_edge_bias_eps,
+        stgformer_temporal_residual=args.stgformer_temporal_residual,
+        stgformer_temporal_hidden_dim=args.stgformer_temporal_hidden_dim,
+        stgformer_temporal_heads=args.stgformer_temporal_heads,
+        stgformer_temporal_local_kernel_size=args.stgformer_temporal_local_kernel_size,
+        stgformer_temporal_landmark_count=args.stgformer_temporal_landmark_count,
+        stgformer_temporal_dropout=args.stgformer_temporal_dropout,
+        stgformer_temporal_residual_init=args.stgformer_temporal_residual_init,
+        stgformer_temporal_bounded_alpha=args.stgformer_temporal_bounded_alpha,
+        stgformer_temporal_alpha_max=args.stgformer_temporal_alpha_max,
+        stgformer_temporal_zero_init=args.stgformer_temporal_zero_init,
+        stgformer_temporal_gate_init=args.stgformer_temporal_gate_init,
+        stgformer_spatial_transformer=args.stgformer_spatial_transformer,
+        stgformer_spatial_heads=args.stgformer_spatial_heads,
+        stgformer_spatial_edge_bias=args.stgformer_spatial_edge_bias,
+        stgformer_spatial_edge_bias_init=args.stgformer_spatial_edge_bias_init,
+        stgformer_spatial_edge_bias_eps=args.stgformer_spatial_edge_bias_eps,
+        d2_hidden_dim=args.d2_hidden_dim,
+        d2_num_layers=args.d2_num_layers,
+        d2_dropout=args.d2_dropout,
+        d2_dilation_cycle=args.d2_dilation_cycle,
+        d2_kernel_size=args.d2_kernel_size,
+        d2_gcn_order=args.d2_gcn_order,
+        d2_node_embed_dim=args.d2_node_embed_dim,
+        d2_adaptive_adj=args.d2_adaptive_adj,
+        d2_use_reverse=args.d2_use_reverse,
+        d2_fusion_init=args.d2_fusion_init,
+    ),
+    data=dict(
+        in_dim=1,
+        out_dim=1,
+        hist_len=args.hist_len,
+        pred_len=args.pred_len,
+        type='bike',
+    ),
+    train=dict(
+        seed=args.seed,
+        epoch=args.epochs,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        limit_train_batches=args.limit_train_batches,
+        limit_val_batches=args.limit_val_batches,
+        limit_test_batches=args.limit_test_batches,
+        num_sanity_val_steps=args.num_sanity_val_steps,
+        save_checkpoints=args.save_checkpoints,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        M=args.fusion_heads,
+        d=args.fusion_head_dim,
+        bn_decay=args.bn_decay,
+        loss=args.loss,
+        huber_delta=args.huber_delta,
+        peak_anchor_loss_weight=args.peak_anchor_loss_weight,
+        peak_anchor_hours=args.peak_anchor_hours,
+        train_anchor_hours=args.train_anchor_hours,
+        init_checkpoint=args.init_checkpoint,
+        freeze_non_ast_tcn=args.freeze_non_ast_tcn,
+        freeze_trainable_scope=args.freeze_trainable_scope,
+        mape_epsilon=args.mape_epsilon,
+        weekday_embed_dim=args.weekday_embed_dim,
+        anchor_homogeneous_batches=args.anchor_homogeneous_batches,
+        output_constraint=args.output_constraint,
+        output_softplus_beta=args.output_softplus_beta,
+        precision=args.precision,
+        grad_clip_val=args.grad_clip_val,
+        monitor_metric=args.monitor_metric,
+        monitor_mode=args.monitor_mode,
+    )
+)
+
+
+LATEST_TRAINING_RECORD_NAME = 'latest_hourly_training_checkpoint.json'
+TRAINING_SUMMARY_NAME = 'training_summary.json'
+TRAIN_ENTRY_SCRIPT_ENV = 'MLSTGCN_TRAIN_ENTRY_SCRIPT'
+TRAIN_ENTRY_ARGS_ENV = 'MLSTGCN_TRAIN_ENTRY_ARGS_JSON'
+TRAIN_RECORD_DIR_ENV = 'MLSTGCN_TRAIN_RECORD_DIR'
+TRAIN_VERSION_TAG_ENV = 'MLSTGCN_VERSION_TAG_OVERRIDE'
+
+
+def get_version_tag():
+    return os.environ.get(TRAIN_VERSION_TAG_ENV) or os.path.basename(PROJ_DIR)
+
+
+def get_training_record_dir():
+    override_dir = os.environ.get(TRAIN_RECORD_DIR_ENV)
+    if override_dir:
+        os.makedirs(override_dir, exist_ok=True)
+        return override_dir
+    return PROJ_DIR
+
+
+def get_latest_training_record_path():
+    return os.path.join(get_training_record_dir(), LATEST_TRAINING_RECORD_NAME)
+
+
+def get_training_summary_dir():
+    return build_analysis_task_dir(
+        project_root=PROJECT_ROOT,
+        version_tag=get_version_tag(),
+        task_type='training_result',
+        extra_tag=args.project,
+    )
+
+
+def _to_float_or_none(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except TypeError:
+        return float(value.item())
+
+
+def _load_json_list_from_env(env_name):
+    raw_value = os.environ.get(env_name)
+    if not raw_value:
+        return None
+    try:
+        value = json.loads(raw_value)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, list) else None
+
+
+def collect_command_metadata():
+    entry_script = os.environ.get(TRAIN_ENTRY_SCRIPT_ENV) or sys.argv[0]
+    entry_args = _load_json_list_from_env(TRAIN_ENTRY_ARGS_ENV) or list(sys.argv[1:])
+    resolved_argv = list(sys.argv)
+    python_exec = os.path.basename(sys.executable) or 'python'
+    return {
+        'python_executable': python_exec,
+        'entry_script': entry_script,
+        'entry_args': entry_args,
+        'entry_command': subprocess.list2cmdline([python_exec, entry_script] + entry_args),
+        'resolved_train_argv': resolved_argv,
+        'resolved_train_command': subprocess.list2cmdline([python_exec] + resolved_argv),
+    }
+
+
+COMMAND_METADATA = collect_command_metadata()
+
+
+def write_latest_training_record(best_checkpoint, last_checkpoint, logger_obj):
+    preferred_checkpoint = best_checkpoint or last_checkpoint
+    if not preferred_checkpoint:
+        return None
+
+    record = {
+        'project': args.project,
+        'project_root': PROJECT_ROOT,
+        'version_tag': get_version_tag(),
+        'preferred_checkpoint': preferred_checkpoint,
+        'best_checkpoint': best_checkpoint or None,
+        'last_checkpoint': last_checkpoint or None,
+        'logger_dir': getattr(logger_obj, 'log_dir', None),
+        'data_dir': args.data_dir,
+        'graph_dir': args.graph_dir,
+        'python_executable': COMMAND_METADATA.get('python_executable'),
+        'entry_script': COMMAND_METADATA.get('entry_script'),
+        'entry_args': COMMAND_METADATA.get('entry_args'),
+        'entry_command': COMMAND_METADATA.get('entry_command'),
+        'resolved_train_argv': COMMAND_METADATA.get('resolved_train_argv'),
+        'resolved_train_command': COMMAND_METADATA.get('resolved_train_command'),
+    }
+    record_path = get_latest_training_record_path()
+    with open(record_path, 'w', encoding='utf-8') as fp:
+        json.dump(record, fp, ensure_ascii=False, indent=2)
+    return record_path
+
+
+def write_training_summary(best_checkpoint, last_checkpoint, logger_obj, best_val_mae_epoch, test_results):
+    summary_dir = ensure_analysis_dir(get_training_summary_dir())
+    summary_path = os.path.join(summary_dir, TRAINING_SUMMARY_NAME)
+    test_result = test_results[0] if test_results else {}
+    summary = {
+        'project': args.project,
+        'version_tag': get_version_tag(),
+        'log_dir': getattr(logger_obj, 'log_dir', None),
+        'data_dir': args.data_dir,
+        'graph_dir': args.graph_dir,
+        'python_executable': COMMAND_METADATA.get('python_executable'),
+        'entry_script': COMMAND_METADATA.get('entry_script'),
+        'entry_args': COMMAND_METADATA.get('entry_args'),
+        'entry_command': COMMAND_METADATA.get('entry_command'),
+        'resolved_train_argv': COMMAND_METADATA.get('resolved_train_argv'),
+        'resolved_train_command': COMMAND_METADATA.get('resolved_train_command'),
+        'best_checkpoint': best_checkpoint or None,
+        'last_checkpoint': last_checkpoint or None,
+        'best_val_mae_epoch': _to_float_or_none(best_val_mae_epoch),
+        'test_mae': _to_float_or_none(test_result.get('test_mae')),
+        'test_loss': _to_float_or_none(test_result.get('test_loss')),
+    }
+    with open(summary_path, 'w', encoding='utf-8') as fp:
+        json.dump(summary, fp, ensure_ascii=False, indent=2)
+    return summary_path
+
+
+def resolve_device(device_arg, gpu_id):
+    if device_arg == 'auto':
+        if torch.cuda.is_available():
+            return torch.device('cuda:%d' % gpu_id)
+        return torch.device('cpu')
+    return torch.device(device_arg)
+
+
+def resolve_project_path(base_dir, path_value):
+    if os.path.isabs(path_value):
+        return path_value
+    return os.path.join(base_dir, path_value)
+
+
+def create_logger(config):
+    if args.logger == 'csv':
+        return hyperparameter_defaults, CSVLogger(save_dir=os.path.join(PROJECT_ROOT, 'logs'), name=args.project)
+
+    if wandb is not None and WandbLogger is not None:
+        try:
+            wandb_project = args.wandb_project or args.project
+            wandb_run_name = args.wandb_run_name or args.project
+            if args.logger == 'wandb':
+                os.environ['WANDB_MODE'] = 'online'
+            wandb.init(
+                config=hyperparameter_defaults,
+                project=wandb_project,
+                name=wandb_run_name,
+                mode='online' if args.logger == 'wandb' else None,
+            )
+            return wandb.config, WandbLogger(project=wandb_project, name=wandb_run_name, offline=False)
+        except Exception as exc:
+            if args.logger == 'wandb':
+                raise
+            print('Wandb init failed, falling back to CSVLogger:', exc)
+
+    if args.logger == 'wandb':
+        raise RuntimeError('Wandb logger requested, but wandb is unavailable in the current environment.')
+
+    return hyperparameter_defaults, CSVLogger(save_dir=os.path.join(PROJECT_ROOT, 'logs'), name=args.project)
+
+
+config, lightning_logger = create_logger(hyperparameter_defaults)
+pl.utilities.seed.seed_everything(config['train']['seed'])
+
+gpu_id = config['server']['gpu_id']
+device = resolve_device(args.device, gpu_id)
+args.data_dir = resolve_project_path(PROJECT_ROOT, args.data_dir)
+args.graph_dir = resolve_project_path(PROJECT_ROOT, args.graph_dir)
+if args.hgaurban_graph_prior_path:
+    args.hgaurban_graph_prior_path = resolve_project_path(PROJECT_ROOT, args.hgaurban_graph_prior_path)
+    if not os.path.exists(args.hgaurban_graph_prior_path):
+        parser.error('--hgaurban_graph_prior_path does not exist: %s' % args.hgaurban_graph_prior_path)
+    config['graph']['hgaurban_graph_prior_path'] = args.hgaurban_graph_prior_path
+if config['model']['ast_tcn_hgaurban_edge_bias'] and not config['graph'].get('hgaurban_graph_prior_path'):
+    parser.error('--ast_tcn_hgaurban_edge_bias requires --hgaurban_graph_prior_path.')
+if args.cssg_rw_graph_prior_path:
+    args.cssg_rw_graph_prior_path = resolve_project_path(PROJECT_ROOT, args.cssg_rw_graph_prior_path)
+    if not os.path.exists(args.cssg_rw_graph_prior_path):
+        parser.error('--cssg_rw_graph_prior_path does not exist: %s' % args.cssg_rw_graph_prior_path)
+    config['graph']['cssg_rw_graph_prior_path'] = args.cssg_rw_graph_prior_path
+if args.init_checkpoint:
+    args.init_checkpoint = resolve_project_path(PROJECT_ROOT, args.init_checkpoint)
+    if not os.path.exists(args.init_checkpoint):
+        parser.error('--init_checkpoint does not exist: %s' % args.init_checkpoint)
+    config['train']['init_checkpoint'] = args.init_checkpoint
+
+if not os.path.exists(args.data_dir):
+    raise FileNotFoundError(
+        'Missing bike temporal data directory: %s. Run prepare_bike_training_data.py first.' % args.data_dir
+    )
+if not os.path.exists(args.graph_dir):
+    raise FileNotFoundError(
+        'Missing bike graph directory: %s. Run prepare_bike_training_data.py first.' % args.graph_dir
+    )
+
+graph = BikeGraph(args.graph_dir, config['graph'], device)
+return_anchor = bool(
+    config['train']['peak_anchor_loss_weight'] != 1.0
+    or config['graph']['context_gate_anchor_hour']
+    or config['graph']['horizon_graph_fusion_gate']
+    or config['model']['ast_tcn_anchor_horizon_gate']
+    or config['train']['anchor_homogeneous_batches']
+)
+train_set = Bike(args.data_dir, 'train', return_anchor=return_anchor)
+val_set = Bike(args.data_dir, 'val', return_anchor=return_anchor)
+test_set = Bike(args.data_dir, 'test', return_anchor=return_anchor)
+scaler = train_set.scaler
+
+
+def filter_dataset_by_anchor_hours(dataset, keep_hours):
+    if not keep_hours:
+        return
+    keep_hours = set(int(hour) for hour in keep_hours)
+    mask = torch.zeros(len(dataset.anchor_hours), dtype=torch.bool).numpy()
+    for hour in keep_hours:
+        mask = mask | (dataset.anchor_hours == hour)
+    kept = int(mask.sum())
+    if kept == 0:
+        parser.error('--train_anchor_hours kept zero training samples.')
+    dataset.x = dataset.x[mask]
+    dataset.y = dataset.y[mask]
+    dataset.anchor_hours = dataset.anchor_hours[mask]
+    dataset.data['x_' + dataset.data_type] = dataset.x
+    dataset.data['y_' + dataset.data_type] = dataset.y
+    dataset.anchor_hours_by_split[dataset.data_type] = dataset.anchor_hours
+    print(
+        'Filtered training samples by anchor hours %s: kept %d / %d'
+        % (sorted(keep_hours), kept, len(mask))
+    )
+
+
+filter_dataset_by_anchor_hours(train_set, config['train']['train_anchor_hours'])
+
+# Auto-sync model input/output dimensions with generated temporal files.
+config['data']['in_dim'] = int(train_set.x.shape[-1])
+config['data']['out_dim'] = int(train_set.y.shape[-1])
+config['data']['hist_len'] = int(train_set.x.shape[1])
+config['data']['pred_len'] = int(train_set.y.shape[1])
+
+
+def resolve_anchor_hour_gate_stats(dataset, requested_index):
+    feature_cols = getattr(dataset, 'input_feature_cols', [])
+    feature_mean = dataset.feature_mean.reshape(-1)
+    feature_std = dataset.feature_std.reshape(-1)
+    hour_index = int(requested_index)
+    if hour_index < 0:
+        for idx, feature_name in enumerate(feature_cols):
+            if feature_name == '小时':
+                hour_index = idx
+                break
+    if hour_index < 0:
+        for idx, feature_name in enumerate(feature_cols):
+            if '小时' in feature_name:
+                hour_index = idx
+                break
+    if hour_index < 0 or hour_index >= len(feature_mean):
+        parser.error('--context_gate_anchor_hour could not infer the hour feature index; pass --context_gate_anchor_hour_index.')
+    return {
+        'context_gate_anchor_hour_index': hour_index,
+        'context_gate_anchor_hour_mean': float(feature_mean[hour_index]),
+        'context_gate_anchor_hour_std': float(feature_std[hour_index] if feature_std[hour_index] != 0 else 1.0),
+    }
+
+
+def resolve_trend_time_stats(dataset, requested_index, time_cycle):
+    feature_cols = getattr(dataset, 'input_feature_cols', [])
+    feature_mean = dataset.feature_mean.reshape(-1)
+    feature_std = dataset.feature_std.reshape(-1)
+    time_index = int(requested_index)
+    if time_index < 0:
+        if int(time_cycle) == 48:
+            preferred_tokens = ['日内半小时序号', '半小时序号', '半小时', 'slot']
+        else:
+            preferred_tokens = ['小时', 'hour']
+        for token in preferred_tokens:
+            for idx, feature_name in enumerate(feature_cols):
+                if token in feature_name and not feature_name.startswith('future_'):
+                    time_index = idx
+                    break
+            if time_index >= 0:
+                break
+    if time_index < 0 or time_index >= len(feature_mean):
+        parser.error('--trend_alignment_decoder could not infer the intra-day time feature; pass --trend_time_feature_index.')
+    return {
+        'trend_time_feature_index': time_index,
+        'trend_time_feature_mean': float(feature_mean[time_index]),
+        'trend_time_feature_std': float(feature_std[time_index] if feature_std[time_index] != 0 else 1.0),
+    }
+
+
+if config['graph']['context_gate_anchor_hour']:
+    config['graph'].update(
+        resolve_anchor_hour_gate_stats(
+            train_set,
+            requested_index=config['graph']['context_gate_anchor_hour_index'],
+        )
+    )
+
+if config['model']['trend_alignment_decoder']:
+    config['model'].update(
+        resolve_trend_time_stats(
+            train_set,
+            requested_index=config['model']['trend_time_feature_index'],
+            time_cycle=config['model']['trend_time_cycle'],
+        )
+    )
+
+
+def build_categorical_feature_configs(dataset, weekday_embed_dim):
+    if weekday_embed_dim <= 0:
+        return []
+    configs = []
+    feature_cols = getattr(dataset, 'input_feature_cols', [])
+    if not feature_cols:
+        return configs
+
+    feature_mean = dataset.feature_mean.reshape(-1)
+    feature_std = dataset.feature_std.reshape(-1)
+    categorical_map = {
+        '星期几': 7,
+        'future_星期几': 7,
+    }
+    for feature_idx, feature_name in enumerate(feature_cols):
+        if feature_name not in categorical_map:
+            continue
+        configs.append(
+            {
+                'index': feature_idx,
+                'num_embeddings': categorical_map[feature_name],
+                'embedding_dim': weekday_embed_dim,
+                'mean': float(feature_mean[feature_idx]),
+                'std': float(feature_std[feature_idx]),
+                'name': feature_name,
+            }
+        )
+    return configs
+
+
+categorical_feature_configs = build_categorical_feature_configs(
+    train_set,
+    weekday_embed_dim=config['train']['weekday_embed_dim'],
+)
+
+
+class AnchorHourBatchSampler(Sampler):
+    def __init__(self, anchor_hours, batch_size, drop_last=True, seed=0):
+        self.batch_size = int(batch_size)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.groups = {}
+        for idx, anchor_hour in enumerate(anchor_hours):
+            self.groups.setdefault(int(anchor_hour), []).append(idx)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        batches = []
+        for indices in self.groups.values():
+            shuffled = list(indices)
+            rng.shuffle(shuffled)
+            for start in range(0, len(shuffled), self.batch_size):
+                batch = shuffled[start:start + self.batch_size]
+                if len(batch) == self.batch_size or (batch and not self.drop_last):
+                    batches.append(batch)
+        rng.shuffle(batches)
+        self.epoch += 1
+        return iter(batches)
+
+    def __len__(self):
+        total = 0
+        for indices in self.groups.values():
+            if self.drop_last:
+                total += len(indices) // self.batch_size
+            else:
+                total += (len(indices) + self.batch_size - 1) // self.batch_size
+        return total
+
+
+class LightningData(LightningDataModule):
+    def __init__(self, train_set, val_set, test_set):
+        super().__init__()
+        self.batch_size = config['train']['batch_size']
+        self.num_workers = config['train']['num_workers']
+        self.pin_memory = device.type == 'cuda'
+        self.train_set = train_set
+        self.val_set = val_set
+        self.test_set = test_set
+
+    def train_dataloader(self):
+        if config['train']['anchor_homogeneous_batches']:
+            return DataLoader(
+                self.train_set,
+                batch_sampler=AnchorHourBatchSampler(
+                    self.train_set.anchor_hours,
+                    batch_size=self.batch_size,
+                    drop_last=True,
+                    seed=config['train']['seed'],
+                ),
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+            )
+        return DataLoader(
+            self.train_set,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            drop_last=True,
+        )
+
+    def val_dataloader(self):
+        if config['train']['anchor_homogeneous_batches']:
+            return DataLoader(
+                self.val_set,
+                batch_size=1,
+                shuffle=False,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                drop_last=False,
+            )
+        return DataLoader(
+            self.val_set,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            drop_last=False,
+        )
+
+    def test_dataloader(self):
+        if config['train']['anchor_homogeneous_batches']:
+            return DataLoader(
+                self.test_set,
+                batch_size=1,
+                shuffle=False,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                drop_last=False,
+            )
+        return DataLoader(
+            self.test_set,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            drop_last=False,
+        )
+
+
+class LightningModel(LightningModule):
+    def __init__(self, scaler, fusiongraph, categorical_feature_configs):
+        super().__init__()
+        self.scaler = scaler
+        self.fusiongraph = fusiongraph
+        self.metric_lightning = LightningMetric(mape_eps=args.mape_epsilon)
+        self.loss_name = args.loss
+        self.huber_delta = args.huber_delta
+        if self.loss_name == 'huber':
+            self.loss = nn.SmoothL1Loss(beta=self.huber_delta, reduction='mean')
+        else:
+            self.loss = nn.L1Loss(reduction='mean')
+
+        if config['model']['use'] == 'MSTGCN':
+            hgaurban_edge_bias_matrix = None
+            if config['model'].get('ast_tcn_hgaurban_edge_bias', False):
+                hgaurban_edge_bias_matrix = np.float32(
+                    np.load(config['graph']['hgaurban_graph_prior_path'])
+                )
+            self.model = MSTGCN_submodule(
+                device,
+                fusiongraph,
+                config['data']['in_dim'],
+                config['data']['hist_len'],
+                config['data']['pred_len'],
+                config['data']['out_dim'],
+                categorical_feature_configs=categorical_feature_configs,
+                cheb_k=config['model']['cheb_k'],
+                nb_block=config['model']['nb_block'],
+                nb_chev_filter=config['model']['nb_chev_filter'],
+                nb_time_filter=config['model']['nb_time_filter'],
+                time_kernel_size=config['model']['time_kernel_size'],
+                channel_attention=config['model']['channel_attention'],
+                channel_attention_reduction=config['model']['channel_attention_reduction'],
+                trend_alignment_decoder=config['model']['trend_alignment_decoder'],
+                trend_time_feature_index=config['model']['trend_time_feature_index'],
+                trend_time_feature_mean=config['model'].get('trend_time_feature_mean', 0.0),
+                trend_time_feature_std=config['model'].get('trend_time_feature_std', 1.0),
+                trend_time_cycle=config['model']['trend_time_cycle'],
+                trend_time_embed_dim=config['model']['trend_time_embed_dim'],
+                trend_attention_heads=config['model']['trend_attention_heads'],
+                trend_dropout=config['model']['trend_dropout'],
+                horizon_specific_prediction_head=config['model']['horizon_specific_prediction_head'],
+                horizon_graph_fusion_decoder=config['model']['horizon_graph_fusion_decoder'],
+                horizon_graph_decoder_residual=config['model']['horizon_graph_decoder_residual'],
+                ast_tcn_residual=config['model']['ast_tcn_residual'],
+                ast_tcn_hidden_dim=config['model']['ast_tcn_hidden_dim'],
+                ast_tcn_layers=config['model']['ast_tcn_layers'],
+                ast_tcn_kernel_size=config['model']['ast_tcn_kernel_size'],
+                ast_tcn_dilation_base=config['model']['ast_tcn_dilation_base'],
+                ast_tcn_heads=config['model']['ast_tcn_heads'],
+                ast_tcn_dropout=config['model']['ast_tcn_dropout'],
+                ast_tcn_residual_init=config['model']['ast_tcn_residual_init'],
+                ast_tcn_bounded_alpha=config['model']['ast_tcn_bounded_alpha'],
+                ast_tcn_alpha_max=config['model']['ast_tcn_alpha_max'],
+                ast_tcn_horizon_alpha=config['model']['ast_tcn_horizon_alpha'],
+                ast_tcn_residual_horizon_mask=config['model']['ast_tcn_residual_horizon_mask'],
+                ast_tcn_zero_init=config['model']['ast_tcn_zero_init'],
+                ast_tcn_residual_gate=config['model']['ast_tcn_residual_gate'],
+                ast_tcn_residual_gate_hidden_dim=config['model']['ast_tcn_residual_gate_hidden_dim'],
+                ast_tcn_residual_gate_init=config['model']['ast_tcn_residual_gate_init'],
+                ast_tcn_anchor_horizon_gate=config['model']['ast_tcn_anchor_horizon_gate'],
+                ast_tcn_anchor_embed_dim=config['model']['ast_tcn_anchor_embed_dim'],
+                ast_tcn_horizon_embed_dim=config['model']['ast_tcn_horizon_embed_dim'],
+                ast_tcn_anchor_horizon_gate_hidden_dim=config['model']['ast_tcn_anchor_horizon_gate_hidden_dim'],
+                ast_tcn_anchor_horizon_gate_init=config['model']['ast_tcn_anchor_horizon_gate_init'],
+                ast_tcn_edge_bias=config['model']['ast_tcn_edge_bias'],
+                ast_tcn_edge_bias_init=config['model']['ast_tcn_edge_bias_init'],
+                ast_tcn_hgaurban_edge_bias=config['model']['ast_tcn_hgaurban_edge_bias'],
+                ast_tcn_hgaurban_edge_bias_init=config['model']['ast_tcn_hgaurban_edge_bias_init'],
+                hgaurban_edge_bias_matrix=hgaurban_edge_bias_matrix,
+                ast_tcn_edge_bias_eps=config['model']['ast_tcn_edge_bias_eps'],
+                sthybrid_ms_residual=config['model']['sthybrid_ms_residual'],
+                sthybrid_ms_hidden_dim=config['model']['sthybrid_ms_hidden_dim'],
+                sthybrid_ms_dilations=config['model']['sthybrid_ms_dilations'],
+                sthybrid_ms_kernel_size=config['model']['sthybrid_ms_kernel_size'],
+                sthybrid_ms_heads=config['model']['sthybrid_ms_heads'],
+                sthybrid_ms_dropout=config['model']['sthybrid_ms_dropout'],
+                sthybrid_ms_residual_init=config['model']['sthybrid_ms_residual_init'],
+                sthybrid_ms_bounded_alpha=config['model']['sthybrid_ms_bounded_alpha'],
+                sthybrid_ms_alpha_max=config['model']['sthybrid_ms_alpha_max'],
+                sthybrid_ms_zero_init=config['model']['sthybrid_ms_zero_init'],
+                sthybrid_ms_edge_bias=config['model']['sthybrid_ms_edge_bias'],
+                sthybrid_ms_edge_bias_init=config['model']['sthybrid_ms_edge_bias_init'],
+                sthybrid_ms_edge_bias_eps=config['model']['sthybrid_ms_edge_bias_eps'],
+                stgformer_temporal_residual=config['model']['stgformer_temporal_residual'],
+                stgformer_temporal_hidden_dim=config['model']['stgformer_temporal_hidden_dim'],
+                stgformer_temporal_heads=config['model']['stgformer_temporal_heads'],
+                stgformer_temporal_local_kernel_size=config['model']['stgformer_temporal_local_kernel_size'],
+                stgformer_temporal_landmark_count=config['model']['stgformer_temporal_landmark_count'],
+                stgformer_temporal_dropout=config['model']['stgformer_temporal_dropout'],
+                stgformer_temporal_residual_init=config['model']['stgformer_temporal_residual_init'],
+                stgformer_temporal_bounded_alpha=config['model']['stgformer_temporal_bounded_alpha'],
+                stgformer_temporal_alpha_max=config['model']['stgformer_temporal_alpha_max'],
+                stgformer_temporal_zero_init=config['model']['stgformer_temporal_zero_init'],
+                stgformer_temporal_gate_init=config['model']['stgformer_temporal_gate_init'],
+                stgformer_spatial_transformer=config['model']['stgformer_spatial_transformer'],
+                stgformer_spatial_heads=config['model']['stgformer_spatial_heads'],
+                stgformer_spatial_edge_bias=config['model']['stgformer_spatial_edge_bias'],
+                stgformer_spatial_edge_bias_init=config['model']['stgformer_spatial_edge_bias_init'],
+                stgformer_spatial_edge_bias_eps=config['model']['stgformer_spatial_edge_bias_eps'],
+            )
+        elif config['model']['use'] == 'D2STGNN':
+            self.model = D2STGNNFusionBackbone(
+                device,
+                fusiongraph,
+                config['data']['in_dim'],
+                config['data']['hist_len'],
+                config['data']['pred_len'],
+                config['data']['out_dim'],
+                categorical_feature_configs=categorical_feature_configs,
+                hidden_dim=config['model']['d2_hidden_dim'],
+                num_layers=config['model']['d2_num_layers'],
+                dropout=config['model']['d2_dropout'],
+                dilation_cycle=config['model']['d2_dilation_cycle'],
+                kernel_size=config['model']['d2_kernel_size'],
+                gcn_order=config['model']['d2_gcn_order'],
+                node_embed_dim=config['model']['d2_node_embed_dim'],
+                adaptive_adj=config['model']['d2_adaptive_adj'],
+                use_reverse=config['model']['d2_use_reverse'],
+                fusion_init=config['model']['d2_fusion_init'],
+            )
+        else:
+            raise NotImplementedError('Unsupported model_use: %s' % config['model']['use'])
+        for param_name, param in self.model.named_parameters():
+            if (
+                param_name.endswith('fusion_alpha')
+                or param_name.endswith('residual_alpha')
+                or param_name.endswith('edge_bias_scale')
+            ):
+                continue
+            if config['model'].get('ast_tcn_zero_init', False) and param_name.startswith('ast_tcn_branch.output_proj.4.'):
+                nn.init.zeros_(param)
+                continue
+            if config['model'].get('sthybrid_ms_zero_init', False) and param_name.startswith('sthybrid_ms_branch.output_proj.4.'):
+                nn.init.zeros_(param)
+                continue
+            if config['model'].get('stgformer_temporal_zero_init', False) and param_name.startswith('stgformer_temporal_branch.output_proj.4.'):
+                nn.init.zeros_(param)
+                continue
+            if config['model'].get('ast_tcn_residual_gate', False) and param_name.startswith('ast_tcn_branch.residual_gate.4.'):
+                if param_name.endswith('.weight'):
+                    nn.init.zeros_(param)
+                else:
+                    gate_init = float(config['model'].get('ast_tcn_residual_gate_init', 0.2))
+                    nn.init.constant_(param, math.log(gate_init / (1.0 - gate_init)))
+                continue
+            if param_name.startswith('stgformer_temporal_branch.gate_proj.1.'):
+                if param_name.endswith('.weight'):
+                    nn.init.zeros_(param)
+                else:
+                    gate_init = float(config['model'].get('stgformer_temporal_gate_init', 0.2))
+                    gate_init = min(max(gate_init, 1e-4), 1.0 - 1e-4)
+                    nn.init.constant_(param, math.log(gate_init / (1.0 - gate_init)))
+                continue
+            if config['model']['use'] == 'D2STGNN' and param_name.endswith('norm.weight'):
+                nn.init.ones_(param)
+                continue
+            if config['model']['use'] == 'D2STGNN' and param_name.endswith('norm.bias'):
+                nn.init.zeros_(param)
+                continue
+            if param.dim() > 1:
+                nn.init.xavier_uniform_(param)
+            else:
+                nn.init.uniform_(param)
+
+        self.log_dict(config)
+
+    def forward(self, x, anchor_hours=None):
+        if config['model']['use'] == 'MSTGCN':
+            return self.model(x, anchor_hours=anchor_hours)
+        return self.model(x)
+
+    def _apply_output_constraint(self, y_hat):
+        # Bike demand targets are counts, so we optionally enforce non-negative predictions in raw space.
+        output_constraint = config['train']['output_constraint']
+        if output_constraint == 'none':
+            return y_hat
+        if output_constraint == 'relu':
+            return F.relu(y_hat)
+        return F.softplus(y_hat, beta=config['train']['output_softplus_beta'])
+
+    def _compute_loss(self, y_hat, y):
+        if self.loss_name == 'huber':
+            return masked_huber(y_hat, y, delta=self.huber_delta)
+        return masked_mae(y_hat, y)
+
+    def _compute_weighted_loss(self, y_hat, y, anchor_hours):
+        if config['train']['peak_anchor_loss_weight'] == 1.0:
+            return self._compute_loss(y_hat, y)
+        peak_hours = config['train']['peak_anchor_hours']
+        if not peak_hours:
+            return self._compute_loss(y_hat, y)
+        anchor_hours = anchor_hours.to(device).long()
+        peak_mask = torch.zeros_like(anchor_hours, dtype=torch.bool)
+        for peak_hour in peak_hours:
+            peak_mask = peak_mask | (anchor_hours == int(peak_hour))
+        sample_weight = torch.ones_like(anchor_hours, dtype=y_hat.dtype, device=device)
+        sample_weight = torch.where(
+            peak_mask,
+            sample_weight * float(config['train']['peak_anchor_loss_weight']),
+            sample_weight,
+        )
+        weight_shape = [sample_weight.shape[0]] + [1] * (y_hat.dim() - 1)
+        sample_weight = sample_weight.view(*weight_shape)
+        if self.loss_name == 'huber':
+            abs_error = torch.abs(y_hat - y)
+            quadratic = torch.clamp(abs_error, max=self.huber_delta)
+            linear = abs_error - quadratic
+            loss = 0.5 * quadratic ** 2 + self.huber_delta * linear
+        else:
+            loss = torch.abs(y_hat - y)
+        loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
+        weighted = loss * sample_weight
+        return weighted.mean() / sample_weight.mean().clamp(min=1e-6)
+
+    def _sync_frozen_module_modes(self):
+        if not config['train'].get('freeze_non_ast_tcn', False):
+            return
+        self.model.eval()
+        if hasattr(self.model, 'ast_tcn_branch'):
+            if self.training:
+                self.model.ast_tcn_branch.train()
+            else:
+                self.model.ast_tcn_branch.eval()
+        if config['train'].get('freeze_trainable_scope') == 'ast_tcn_final_head':
+            if hasattr(self.model, 'final_conv'):
+                if self.training:
+                    self.model.final_conv.train()
+                else:
+                    self.model.final_conv.eval()
+            if hasattr(self.model, 'trend_decoder'):
+                if self.training:
+                    self.model.trend_decoder.train()
+                else:
+                    self.model.trend_decoder.eval()
+
+    def _run_model(self, batch):
+        self._sync_frozen_module_modes()
+        if len(batch) == 3:
+            x, y, anchor_hours = batch
+        else:
+            x, y = batch
+            anchor_hours = None
+        x = x.to(device).float()
+        y = y.to(device).float()
+        if anchor_hours is not None:
+            anchor_hours = anchor_hours.to(device).long()
+        y_hat = self(x, anchor_hours=anchor_hours)
+        y_hat = self.scaler.inverse_transform(y_hat)
+        y_hat = self._apply_output_constraint(y_hat)
+        loss = self._compute_loss(y_hat, y)
+        mae_loss = masked_mae(y_hat, y)
+        return y_hat, y, loss, mae_loss, anchor_hours
+
+    def training_step(self, batch, batch_idx):
+        y_hat, y, loss, mae_loss, anchor_hours = self._run_model(batch)
+        if anchor_hours is not None:
+            loss = self._compute_weighted_loss(y_hat, y, anchor_hours)
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log('train_mae', mae_loss, on_step=True, on_epoch=True, prog_bar=False, logger=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        y_hat, y, loss, mae_loss, _ = self._run_model(batch)
+        self.log('val_loss_step', loss, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+        self.log('val_mae_step', mae_loss, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+        self.log('val_loss_epoch', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log('val_mae_epoch', mae_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
+    def test_step(self, batch, batch_idx):
+        y_hat, y, loss, mae_loss, _ = self._run_model(batch)
+        self.metric_lightning(y_hat.cpu().float(), y.cpu().float())
+        self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log('test_mae', mae_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+
+    def test_epoch_end(self, outputs):
+        self.log_dict(self.metric_lightning.compute())
+
+    def configure_optimizers(self):
+        trainable_params = [param for param in self.parameters() if param.requires_grad]
+        if not trainable_params:
+            raise RuntimeError('No trainable parameters remain. Check freeze settings.')
+        optimizer = Adam(trainable_params, lr=config['train']['lr'], weight_decay=config['train']['weight_decay'])
+        scheduler = ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=args.lr_factor,
+            patience=args.lr_patience,
+            min_lr=args.min_lr,
+        )
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'monitor': config['train']['monitor_metric'],
+                'interval': 'epoch',
+                'frequency': 1,
+            },
+        }
+
+
+def main():
+    fusiongraph = FusionGraphModel(
+        graph,
+        device,
+        config['graph'],
+        config['data'],
+        config['train']['M'],
+        config['train']['d'],
+        config['train']['bn_decay'],
+    )
+    lightning_data = LightningData(train_set, val_set, test_set)
+    lightning_model = LightningModel(scaler, fusiongraph, categorical_feature_configs)
+
+    def freeze_non_ast_tcn_parameters(model):
+        trainable_scope = config['train'].get('freeze_trainable_scope', 'ast_tcn')
+        trainable_prefixes = ['model.ast_tcn_branch.']
+        if trainable_scope == 'ast_tcn_final_head':
+            trainable_prefixes.extend([
+                'model.final_conv.',
+                'model.horizon_final_convs.',
+                'model.trend_decoder.',
+            ])
+        trainable_names = []
+        frozen_count = 0
+        trainable_count = 0
+        for param_name, param in model.named_parameters():
+            keep_trainable = any(param_name.startswith(prefix) for prefix in trainable_prefixes)
+            param.requires_grad = keep_trainable
+            if keep_trainable:
+                trainable_names.append(param_name)
+                trainable_count += param.numel()
+            else:
+                frozen_count += param.numel()
+        if not trainable_names:
+            raise RuntimeError(
+                '--freeze_non_ast_tcn found no parameters to train for scope %s.'
+                % trainable_scope
+            )
+        print(
+            'Frozen non-AST-TCN parameters: scope=%s frozen=%d trainable=%d trainable_tensors=%d'
+            % (trainable_scope, frozen_count, trainable_count, len(trainable_names))
+        )
+        print('Trainable parameter prefixes include:', trainable_names[:10])
+
+    if config['train']['init_checkpoint']:
+        checkpoint = torch.load(config['train']['init_checkpoint'], map_location=device)
+        state_dict = checkpoint.get('state_dict', checkpoint)
+        missing, unexpected = lightning_model.load_state_dict(state_dict, strict=False)
+        if missing or unexpected:
+            print('Loaded init checkpoint with missing keys:', missing)
+            print('Loaded init checkpoint with unexpected keys:', unexpected)
+        print('Loaded init checkpoint weights:', config['train']['init_checkpoint'])
+    if config['train']['freeze_non_ast_tcn']:
+        freeze_non_ast_tcn_parameters(lightning_model)
+    checkpoint_callback = None
+    if config['train']['save_checkpoints']:
+        checkpoint_filename = 'best-{epoch:02d}-' + args.monitor_metric + '={' + args.monitor_metric + ':.4f}'
+        checkpoint_callback = ModelCheckpoint(
+            monitor=args.monitor_metric,
+            mode=args.monitor_mode,
+            save_top_k=1,
+            save_last=True,
+            filename=checkpoint_filename,
+        )
+    early_stopping_callback = EarlyStopping(
+        monitor=args.monitor_metric,
+        mode=args.monitor_mode,
+        patience=args.early_stop_patience,
+    )
+    lr_monitor = LearningRateMonitor(logging_interval='epoch')
+
+    def normalize_limit_batches(value):
+        if value is None:
+            return 1.0
+        value = float(value)
+        if value >= 1.0:
+            return int(value)
+        return value
+
+    callbacks = [early_stopping_callback, lr_monitor]
+    if checkpoint_callback is not None:
+        callbacks.insert(0, checkpoint_callback)
+
+    trainer_kwargs = dict(
+        logger=lightning_logger,
+        max_epochs=config['train']['epoch'],
+        callbacks=callbacks,
+        precision=config['train']['precision'],
+        gradient_clip_val=config['train']['grad_clip_val'],
+        limit_train_batches=normalize_limit_batches(config['train']['limit_train_batches']),
+        limit_val_batches=normalize_limit_batches(config['train']['limit_val_batches']),
+        limit_test_batches=normalize_limit_batches(config['train']['limit_test_batches']),
+        num_sanity_val_steps=config['train']['num_sanity_val_steps'],
+    )
+    if int(pl.__version__.split('.')[0]) >= 2:
+        trainer_kwargs.update({
+            'accelerator': 'gpu' if device.type == 'cuda' else 'cpu',
+            'devices': 1,
+        })
+    else:
+        trainer_kwargs.update({
+            'gpus': [gpu_id] if device.type == 'cuda' else 0,
+        })
+
+    trainer = Trainer(**trainer_kwargs)
+    trainer.fit(lightning_model, lightning_data)
+    best_model_path = checkpoint_callback.best_model_path if checkpoint_callback is not None else ''
+    last_model_path = checkpoint_callback.last_model_path if checkpoint_callback is not None else ''
+    test_results = None
+    if best_model_path:
+        try:
+            test_results = trainer.test(datamodule=lightning_data, ckpt_path='best')
+        except TypeError:
+            test_results = trainer.test(ckpt_path=best_model_path, datamodule=lightning_data)
+    else:
+        test_results = trainer.test(lightning_model, datamodule=lightning_data)
+    training_record_path = write_latest_training_record(
+        best_checkpoint=best_model_path,
+        last_checkpoint=last_model_path,
+        logger_obj=lightning_logger,
+    )
+    training_summary_path = write_training_summary(
+        best_checkpoint=best_model_path,
+        last_checkpoint=last_model_path,
+        logger_obj=lightning_logger,
+        best_val_mae_epoch=checkpoint_callback.best_model_score if checkpoint_callback is not None else None,
+        test_results=test_results,
+    )
+    try:
+        build_and_save_analysis_registry(PROJECT_ROOT)
+    except ModuleNotFoundError as exc:
+        if exc.name != 'openpyxl':
+            raise
+        print('Skip analysis registry Excel export because openpyxl is not installed.')
+    print('Bike graph use:', config['graph']['use'])
+    print('Bike data:', config['data'])
+    print('Project root:', PROJECT_ROOT)
+    print('Data dir:', args.data_dir)
+    print('Graph dir:', args.graph_dir)
+    print('Applied log1p input feature cols:', getattr(train_set, 'log1p_feature_cols', []))
+    print('Categorical feature configs:', categorical_feature_configs)
+    print('Device:', str(device))
+    print('Best checkpoint:', best_model_path if best_model_path else 'None')
+    print('Last checkpoint:', last_model_path if last_model_path else 'None')
+    print('Latest training record:', training_record_path if training_record_path else 'None')
+    print('Training summary:', training_summary_path if training_summary_path else 'None')
+
+
+if __name__ == '__main__':
+    main()
