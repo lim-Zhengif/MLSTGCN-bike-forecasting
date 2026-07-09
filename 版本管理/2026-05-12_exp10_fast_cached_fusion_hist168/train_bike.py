@@ -254,6 +254,14 @@ parser.add_argument(
     default=3,
     help='Temporal convolution kernel size inside MSTGCN blocks. Must be an odd number such as 3, 5, or 7.',
 )
+parser.add_argument('--backbone_adaptive_graph', default='false', help="Use 'true' or 'false' to enable adaptive support weighting inside the MSTGCN backbone graph convolution.")
+parser.add_argument('--backbone_support_gate_hidden_dim', type=int, default=32)
+parser.add_argument('--backbone_support_gate_temperature', type=float, default=1.0)
+parser.add_argument('--backbone_multiscale_temporal', default='false', help="Use 'true' or 'false' to replace the single backbone time convolution with a causal multi-scale temporal mixer.")
+parser.add_argument('--backbone_temporal_dilations', default='1,2,4', help="Comma-separated dilation values for the causal multi-scale backbone temporal mixer.")
+parser.add_argument('--backbone_temporal_gate_hidden_dim', type=int, default=32)
+parser.add_argument('--backbone_branch_gate', default='false', help="Use 'true' or 'false' to learn a branch gate over graph, temporal, and residual backbone paths.")
+parser.add_argument('--backbone_branch_gate_hidden_dim', type=int, default=32)
 parser.add_argument('--channel_attention', default='false', help="Use 'true' or 'false' to enable channel attention in MSTGCN.")
 parser.add_argument('--channel_attention_reduction', type=int, default=4)
 parser.add_argument('--trend_alignment_decoder', default='false', help="Use 'true' or 'false' to enable the TSTAD-style trend-alignment parallel decoder.")
@@ -483,6 +491,9 @@ args.stgformer_temporal_zero_init = parse_bool_arg(
 )
 args.stgformer_spatial_transformer = parse_bool_arg(args.stgformer_spatial_transformer, '--stgformer_spatial_transformer')
 args.stgformer_spatial_edge_bias = parse_bool_arg(args.stgformer_spatial_edge_bias, '--stgformer_spatial_edge_bias')
+args.backbone_adaptive_graph = parse_bool_arg(args.backbone_adaptive_graph, '--backbone_adaptive_graph')
+args.backbone_multiscale_temporal = parse_bool_arg(args.backbone_multiscale_temporal, '--backbone_multiscale_temporal')
+args.backbone_branch_gate = parse_bool_arg(args.backbone_branch_gate, '--backbone_branch_gate')
 args.save_checkpoints = parse_bool_arg(args.save_checkpoints, '--save_checkpoints')
 args.channel_attention = parse_bool_arg(args.channel_attention, '--channel_attention')
 args.d2_adaptive_adj = parse_bool_arg(args.d2_adaptive_adj, '--d2_adaptive_adj')
@@ -495,6 +506,7 @@ args.ast_tcn_residual_horizon_mask = parse_float_list(
     '--ast_tcn_residual_horizon_mask',
 )
 args.sthybrid_ms_dilations = parse_int_list(args.sthybrid_ms_dilations, '--sthybrid_ms_dilations')
+args.backbone_temporal_dilations = parse_int_list(args.backbone_temporal_dilations, '--backbone_temporal_dilations')
 
 if args.graph_topk < 0:
     parser.error('--graph_topk must be >= 0.')
@@ -655,6 +667,18 @@ if args.stgformer_spatial_edge_bias_init < 0:
     parser.error('--stgformer_spatial_edge_bias_init must be >= 0.')
 if args.stgformer_spatial_edge_bias_eps <= 0:
     parser.error('--stgformer_spatial_edge_bias_eps must be > 0.')
+if args.backbone_support_gate_hidden_dim <= 0:
+    parser.error('--backbone_support_gate_hidden_dim must be > 0.')
+if args.backbone_support_gate_temperature <= 0:
+    parser.error('--backbone_support_gate_temperature must be > 0.')
+if args.backbone_temporal_gate_hidden_dim <= 0:
+    parser.error('--backbone_temporal_gate_hidden_dim must be > 0.')
+if args.backbone_branch_gate_hidden_dim <= 0:
+    parser.error('--backbone_branch_gate_hidden_dim must be > 0.')
+if args.backbone_multiscale_temporal and not args.backbone_temporal_dilations:
+    parser.error('--backbone_multiscale_temporal requires --backbone_temporal_dilations to include at least one positive dilation.')
+if any(dilation <= 0 for dilation in args.backbone_temporal_dilations):
+    parser.error('--backbone_temporal_dilations values must be > 0.')
 if args.sthybrid_ms_residual and (args.ast_tcn_residual or args.stgformer_temporal_residual):
     parser.error('Do not combine --sthybrid_ms_residual with AST-TCN or STGformer temporal residual branches.')
 if args.fusion_heads <= 0:
@@ -833,6 +857,14 @@ hyperparameter_defaults = dict(
         stgformer_spatial_edge_bias=args.stgformer_spatial_edge_bias,
         stgformer_spatial_edge_bias_init=args.stgformer_spatial_edge_bias_init,
         stgformer_spatial_edge_bias_eps=args.stgformer_spatial_edge_bias_eps,
+        backbone_adaptive_graph=args.backbone_adaptive_graph,
+        backbone_support_gate_hidden_dim=args.backbone_support_gate_hidden_dim,
+        backbone_support_gate_temperature=args.backbone_support_gate_temperature,
+        backbone_multiscale_temporal=args.backbone_multiscale_temporal,
+        backbone_temporal_dilations=args.backbone_temporal_dilations,
+        backbone_temporal_gate_hidden_dim=args.backbone_temporal_gate_hidden_dim,
+        backbone_branch_gate=args.backbone_branch_gate,
+        backbone_branch_gate_hidden_dim=args.backbone_branch_gate_hidden_dim,
         d2_hidden_dim=args.d2_hidden_dim,
         d2_num_layers=args.d2_num_layers,
         d2_dropout=args.d2_dropout,
@@ -1444,6 +1476,14 @@ class LightningModel(LightningModule):
                 stgformer_spatial_edge_bias=config['model']['stgformer_spatial_edge_bias'],
                 stgformer_spatial_edge_bias_init=config['model']['stgformer_spatial_edge_bias_init'],
                 stgformer_spatial_edge_bias_eps=config['model']['stgformer_spatial_edge_bias_eps'],
+                backbone_adaptive_graph=config['model']['backbone_adaptive_graph'],
+                backbone_support_gate_hidden_dim=config['model']['backbone_support_gate_hidden_dim'],
+                backbone_support_gate_temperature=config['model']['backbone_support_gate_temperature'],
+                backbone_multiscale_temporal=config['model']['backbone_multiscale_temporal'],
+                backbone_temporal_dilations=config['model']['backbone_temporal_dilations'],
+                backbone_temporal_gate_hidden_dim=config['model']['backbone_temporal_gate_hidden_dim'],
+                backbone_branch_gate=config['model']['backbone_branch_gate'],
+                backbone_branch_gate_hidden_dim=config['model']['backbone_branch_gate_hidden_dim'],
             )
         elif config['model']['use'] == 'D2STGNN':
             self.model = D2STGNNFusionBackbone(

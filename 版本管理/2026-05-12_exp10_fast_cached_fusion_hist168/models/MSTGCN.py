@@ -737,7 +737,6 @@ class LocalGlobalTemporalResidualBranch(nn.Module):
             embed_dim=self.hidden_dim,
             num_heads=heads,
             dropout=float(dropout),
-            batch_first=True,
         )
         self.norm_local = nn.LayerNorm(self.hidden_dim)
         self.norm_global = nn.LayerNorm(self.hidden_dim)
@@ -813,7 +812,13 @@ class LocalGlobalTemporalResidualBranch(nn.Module):
             pooled = F.adaptive_avg_pool1d(hidden.transpose(1, 2), self.landmark_count).transpose(1, 2)
         else:
             pooled = hidden
-        global_out, _ = self.global_attention(hidden, pooled, pooled, need_weights=False)
+        global_out, _ = self.global_attention(
+            hidden.transpose(0, 1),
+            pooled.transpose(0, 1),
+            pooled.transpose(0, 1),
+            need_weights=False,
+        )
+        global_out = global_out.transpose(0, 1)
         hidden = self.norm_global(hidden + self.dropout(global_out))
         hidden = self.norm_ffn(hidden + self.dropout(self.ffn(hidden)))
 
@@ -835,7 +840,17 @@ class cheb_conv(nn.Module):
     K-order chebyshev graph convolution
     '''
 
-    def __init__(self, K, fusiongraph, in_channels, out_channels, device):
+    def __init__(
+        self,
+        K,
+        fusiongraph,
+        in_channels,
+        out_channels,
+        device,
+        adaptive_support_gate=False,
+        support_gate_hidden_dim=32,
+        support_gate_temperature=1.0,
+    ):
         '''
         :param K: int
         :param in_channles: int, num of channels in the input sequence
@@ -847,7 +862,21 @@ class cheb_conv(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.DEVICE = device
+        self.use_adaptive_support_gate = bool(adaptive_support_gate)
+        self.support_gate_temperature = float(support_gate_temperature)
         self.Theta = nn.ParameterList([nn.Parameter(torch.FloatTensor(in_channels, out_channels).to(self.DEVICE)) for _ in range(K)])
+        if self.use_adaptive_support_gate:
+            support_gate_hidden_dim = max(int(support_gate_hidden_dim), 1)
+            self.support_gate = nn.Sequential(
+                nn.LayerNorm(int(in_channels)),
+                nn.Linear(int(in_channels), support_gate_hidden_dim),
+                nn.GELU(),
+                nn.Linear(support_gate_hidden_dim, int(K)),
+            )
+            nn.init.zeros_(self.support_gate[-1].weight)
+            nn.init.zeros_(self.support_gate[-1].bias)
+        else:
+            self.support_gate = None
 
     def build_cheb_polynomials(self, adj_for_run):
         degree = adj_for_run.sum(dim=1)
@@ -872,8 +901,68 @@ class cheb_conv(nn.Module):
         # Original implementation looped over every history step. This einsum
         # keeps the same right-multiplied graph convention while processing the
         # whole temporal axis in one batched operation.
-        output = torch.einsum('bmct,kmn,kco->bnot', x, supports, theta)
+        if self.use_adaptive_support_gate:
+            context_summary = x.mean(dim=(1, 3))
+            support_logits = self.support_gate(context_summary)
+            support_weights = torch.softmax(support_logits / max(self.support_gate_temperature, 1e-6), dim=-1)
+            output = torch.einsum('bmct,kmn,kco,bk->bnot', x, supports, theta, support_weights)
+        else:
+            output = torch.einsum('bmct,kmn,kco->bnot', x, supports, theta)
         return F.relu(output)
+
+
+class CausalMultiScaleTemporalMixer(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        time_strides,
+        kernel_size=3,
+        dilations=(1, 2, 4),
+        dropout=0.1,
+        gate_hidden_dim=32,
+    ):
+        super(CausalMultiScaleTemporalMixer, self).__init__()
+        self.kernel_size = int(kernel_size)
+        if self.kernel_size <= 0:
+            raise ValueError("kernel_size must be > 0.")
+        self.dilations = tuple(int(item) for item in dilations if int(item) > 0)
+        if not self.dilations:
+            raise ValueError("dilations must include at least one positive value.")
+        self.branches = nn.ModuleList([
+            nn.Conv2d(
+                int(in_channels),
+                int(out_channels),
+                kernel_size=(1, self.kernel_size),
+                stride=(1, int(time_strides)),
+                padding=0,
+                dilation=(1, int(dilation)),
+            )
+            for dilation in self.dilations
+        ])
+        gate_hidden_dim = max(int(gate_hidden_dim), 1)
+        self.branch_gate = nn.Sequential(
+            nn.LayerNorm(int(in_channels)),
+            nn.Linear(int(in_channels), gate_hidden_dim),
+            nn.GELU(),
+            nn.Linear(gate_hidden_dim, len(self.dilations)),
+        )
+        nn.init.zeros_(self.branch_gate[-1].weight)
+        nn.init.zeros_(self.branch_gate[-1].bias)
+        self.dropout = nn.Dropout(float(dropout))
+
+    def forward(self, x, context_summary=None):
+        if context_summary is None:
+            context_summary = x.mean(dim=(2, 3))
+        branch_weights = torch.softmax(self.branch_gate(context_summary), dim=-1)
+        branch_outputs = []
+        for dilation, branch in zip(self.dilations, self.branches):
+            left_padding = int(dilation) * (self.kernel_size - 1)
+            branch_input = F.pad(x, (left_padding, 0, 0, 0))
+            branch_outputs.append(branch(branch_input))
+        stacked = torch.stack(branch_outputs, dim=1)
+        fused = torch.sum(stacked * branch_weights[:, :, None, None, None], dim=1)
+        return self.dropout(fused)
 
 
 class MSTGCN_block(nn.Module):
@@ -890,20 +979,65 @@ class MSTGCN_block(nn.Module):
         time_kernel_size=3,
         channel_attention=False,
         channel_attention_reduction=4,
+        backbone_adaptive_graph=False,
+        backbone_support_gate_hidden_dim=32,
+        backbone_support_gate_temperature=1.0,
+        backbone_multiscale_temporal=False,
+        backbone_temporal_dilations=None,
+        backbone_temporal_gate_hidden_dim=32,
+        backbone_branch_gate=False,
+        backbone_branch_gate_hidden_dim=32,
     ):
         super(MSTGCN_block, self).__init__()
         time_kernel_size = int(time_kernel_size)
         time_padding = time_kernel_size // 2
-        self.cheb_conv = cheb_conv(K, fusiongraph, in_channels, nb_chev_filter, device)
-        self.time_conv = nn.Conv2d(
+        self.use_backbone_adaptive_graph = bool(backbone_adaptive_graph)
+        self.use_backbone_multiscale_temporal = bool(backbone_multiscale_temporal)
+        self.use_backbone_branch_gate = bool(backbone_branch_gate)
+        self.cheb_conv = cheb_conv(
+            K,
+            fusiongraph,
+            in_channels,
             nb_chev_filter,
-            nb_time_filter,
-            kernel_size=(1, time_kernel_size),
-            stride=(1, time_strides),
-            padding=(0, time_padding),
+            device,
+            adaptive_support_gate=self.use_backbone_adaptive_graph,
+            support_gate_hidden_dim=backbone_support_gate_hidden_dim,
+            support_gate_temperature=backbone_support_gate_temperature,
         )
+        self.graph_proj = nn.Conv2d(nb_chev_filter, nb_time_filter, kernel_size=(1, 1), stride=(1, 1))
+        if self.use_backbone_multiscale_temporal:
+            if backbone_temporal_dilations is None:
+                backbone_temporal_dilations = (1, 2, 4)
+            self.time_mixer = CausalMultiScaleTemporalMixer(
+                nb_chev_filter,
+                nb_time_filter,
+                time_strides,
+                kernel_size=time_kernel_size,
+                dilations=backbone_temporal_dilations,
+                dropout=0.1,
+                gate_hidden_dim=backbone_temporal_gate_hidden_dim,
+            )
+        else:
+            self.time_conv = nn.Conv2d(
+                nb_chev_filter,
+                nb_time_filter,
+                kernel_size=(1, time_kernel_size),
+                stride=(1, time_strides),
+                padding=(0, time_padding),
+            )
         self.residual_conv = nn.Conv2d(in_channels, nb_time_filter, kernel_size=(1, 1), stride=(1, time_strides))
         self.ln = nn.LayerNorm(nb_time_filter)
+        if self.use_backbone_branch_gate:
+            self.backbone_branch_gate = nn.Sequential(
+                nn.LayerNorm(nb_chev_filter),
+                nn.Linear(nb_chev_filter, max(int(backbone_branch_gate_hidden_dim), 1)),
+                nn.GELU(),
+                nn.Linear(max(int(backbone_branch_gate_hidden_dim), 1), 3),
+            )
+            nn.init.zeros_(self.backbone_branch_gate[-1].weight)
+            nn.init.zeros_(self.backbone_branch_gate[-1].bias)
+        else:
+            self.backbone_branch_gate = None
         if channel_attention:
             self.channel_attention = ChannelAttention(nb_time_filter, reduction=channel_attention_reduction)
         else:
@@ -917,13 +1051,23 @@ class MSTGCN_block(nn.Module):
         # cheb gcn
         spatial_gcn = self.cheb_conv(x, cheb_polynomials=cheb_polynomials)  # (b,N,F,T)
 
-        # convolution along the time axis
-        time_conv_output = self.time_conv(spatial_gcn.permute(0, 2, 1, 3))  # (b,F,N,T)
-
-        # residual shortcut
+        spatial_gcn_c = spatial_gcn.permute(0, 2, 1, 3)  # (b,F,N,T)
         x_residual = self.residual_conv(x.permute(0, 2, 1, 3))  # (b,F,N,T)
-
-        x_residual = self.ln(F.relu(x_residual + time_conv_output).permute(0, 3, 2, 1)).permute(0, 2, 3, 1)  # (b,N,F,T)
+        graph_branch = self.graph_proj(spatial_gcn_c)
+        if self.use_backbone_multiscale_temporal:
+            temporal_branch = self.time_mixer(spatial_gcn_c, context_summary=spatial_gcn.mean(dim=(1, 3)))
+        else:
+            temporal_branch = self.time_conv(spatial_gcn_c)
+        if self.use_backbone_branch_gate:
+            branch_weights = torch.softmax(self.backbone_branch_gate(spatial_gcn.mean(dim=(1, 3))), dim=-1)
+            fused = (
+                branch_weights[:, 0].view(-1, 1, 1, 1) * graph_branch
+                + branch_weights[:, 1].view(-1, 1, 1, 1) * temporal_branch
+                + branch_weights[:, 2].view(-1, 1, 1, 1) * x_residual
+            )
+        else:
+            fused = x_residual + temporal_branch
+        x_residual = self.ln(F.relu(fused).permute(0, 3, 2, 1)).permute(0, 2, 3, 1)  # (b,N,F,T)
         x_residual = self.channel_attention(x_residual)
 
         return x_residual
@@ -1014,6 +1158,14 @@ class MSTGCN_submodule(nn.Module):
         stgformer_spatial_edge_bias=True,
         stgformer_spatial_edge_bias_init=0.05,
         stgformer_spatial_edge_bias_eps=1e-6,
+        backbone_adaptive_graph=False,
+        backbone_support_gate_hidden_dim=32,
+        backbone_support_gate_temperature=1.0,
+        backbone_multiscale_temporal=False,
+        backbone_temporal_dilations=None,
+        backbone_temporal_gate_hidden_dim=32,
+        backbone_branch_gate=False,
+        backbone_branch_gate_hidden_dim=32,
     ):
 
 
@@ -1068,6 +1220,14 @@ class MSTGCN_submodule(nn.Module):
                 time_kernel_size=time_kernel_size,
                 channel_attention=channel_attention,
                 channel_attention_reduction=channel_attention_reduction,
+                backbone_adaptive_graph=backbone_adaptive_graph,
+                backbone_support_gate_hidden_dim=backbone_support_gate_hidden_dim,
+                backbone_support_gate_temperature=backbone_support_gate_temperature,
+                backbone_multiscale_temporal=backbone_multiscale_temporal,
+                backbone_temporal_dilations=backbone_temporal_dilations,
+                backbone_temporal_gate_hidden_dim=backbone_temporal_gate_hidden_dim,
+                backbone_branch_gate=backbone_branch_gate,
+                backbone_branch_gate_hidden_dim=backbone_branch_gate_hidden_dim,
             )
         ])
 
@@ -1083,6 +1243,14 @@ class MSTGCN_submodule(nn.Module):
                 time_kernel_size=time_kernel_size,
                 channel_attention=channel_attention,
                 channel_attention_reduction=channel_attention_reduction,
+                backbone_adaptive_graph=backbone_adaptive_graph,
+                backbone_support_gate_hidden_dim=backbone_support_gate_hidden_dim,
+                backbone_support_gate_temperature=backbone_support_gate_temperature,
+                backbone_multiscale_temporal=backbone_multiscale_temporal,
+                backbone_temporal_dilations=backbone_temporal_dilations,
+                backbone_temporal_gate_hidden_dim=backbone_temporal_gate_hidden_dim,
+                backbone_branch_gate=backbone_branch_gate,
+                backbone_branch_gate_hidden_dim=backbone_branch_gate_hidden_dim,
             )
             for _ in range(nb_block - 1)
         ])
