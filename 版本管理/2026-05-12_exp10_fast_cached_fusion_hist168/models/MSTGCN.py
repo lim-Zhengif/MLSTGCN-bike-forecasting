@@ -850,6 +850,12 @@ class cheb_conv(nn.Module):
         adaptive_support_gate=False,
         support_gate_hidden_dim=32,
         support_gate_temperature=1.0,
+        dynamic_graph=False,
+        dynamic_graph_hidden_dim=32,
+        dynamic_graph_topk=20,
+        dynamic_graph_init_lambda=0.8,
+        dynamic_graph_residual=False,
+        dynamic_graph_residual_init=0.01,
     ):
         '''
         :param K: int
@@ -864,6 +870,9 @@ class cheb_conv(nn.Module):
         self.DEVICE = device
         self.use_adaptive_support_gate = bool(adaptive_support_gate)
         self.support_gate_temperature = float(support_gate_temperature)
+        self.use_dynamic_graph = bool(dynamic_graph)
+        self.use_dynamic_graph_residual = bool(dynamic_graph_residual)
+        self.dynamic_graph_topk = int(dynamic_graph_topk)
         self.Theta = nn.ParameterList([nn.Parameter(torch.FloatTensor(in_channels, out_channels).to(self.DEVICE)) for _ in range(K)])
         if self.use_adaptive_support_gate:
             support_gate_hidden_dim = max(int(support_gate_hidden_dim), 1)
@@ -877,26 +886,113 @@ class cheb_conv(nn.Module):
             nn.init.zeros_(self.support_gate[-1].bias)
         else:
             self.support_gate = None
+        if self.use_dynamic_graph or self.use_dynamic_graph_residual:
+            dynamic_graph_hidden_dim = max(int(dynamic_graph_hidden_dim), 1)
+            self.dynamic_node_norm = nn.LayerNorm(int(in_channels))
+            self.dynamic_query = nn.Linear(int(in_channels), dynamic_graph_hidden_dim)
+            self.dynamic_key = nn.Linear(int(in_channels), dynamic_graph_hidden_dim)
+            if self.use_dynamic_graph:
+                self.dynamic_lambda_gate = nn.Sequential(
+                    nn.LayerNorm(int(in_channels)),
+                    nn.Linear(int(in_channels), dynamic_graph_hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(dynamic_graph_hidden_dim, 1),
+                )
+                init_lambda = min(max(float(dynamic_graph_init_lambda), 1e-4), 1.0 - 1e-4)
+                nn.init.zeros_(self.dynamic_lambda_gate[-1].weight)
+                nn.init.constant_(self.dynamic_lambda_gate[-1].bias, math.log(init_lambda / (1.0 - init_lambda)))
+            else:
+                self.dynamic_lambda_gate = None
+            if self.use_dynamic_graph_residual:
+                init_beta = max(float(dynamic_graph_residual_init), 0.0)
+                self.dynamic_residual_beta = nn.Parameter(torch.tensor(init_beta, dtype=torch.float32))
+            else:
+                self.dynamic_residual_beta = None
+        else:
+            self.dynamic_node_norm = None
+            self.dynamic_query = None
+            self.dynamic_key = None
+            self.dynamic_lambda_gate = None
+            self.dynamic_residual_beta = None
 
     def build_cheb_polynomials(self, adj_for_run):
         degree = adj_for_run.sum(dim=1)
         L_tilde = torch.diag(degree) - adj_for_run
         return cheb_polynomial_torch(L_tilde, self.K)
 
-    def forward(self, x, cheb_polynomials=None):
+    def _prepare_static_adj(self, adj_for_run, batch_size, device, dtype):
+        if adj_for_run is None:
+            adj_for_run = self.fusiongraph()
+        static_adj = adj_for_run.to(device=device, dtype=dtype)
+        if static_adj.dim() == 2:
+            static_adj = static_adj.unsqueeze(0).expand(batch_size, -1, -1)
+        elif static_adj.dim() == 3:
+            if static_adj.size(0) != batch_size:
+                if static_adj.size(0) == 1:
+                    static_adj = static_adj.expand(batch_size, -1, -1)
+                else:
+                    static_adj = static_adj[:batch_size]
+        else:
+            raise ValueError("adj_for_run must be a 2D or 3D adjacency tensor.")
+        static_adj = torch.clamp(static_adj, min=0.0)
+        return static_adj / static_adj.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+
+    def _build_dynamic_adj(self, x):
+        node_context = x.mean(dim=3)
+        node_context = self.dynamic_node_norm(node_context)
+        query = self.dynamic_query(node_context)
+        key = self.dynamic_key(node_context)
+        scores = torch.matmul(query, key.transpose(1, 2)) / math.sqrt(max(query.size(-1), 1))
+        dynamic_adj = torch.softmax(scores, dim=-1)
+        if 0 < self.dynamic_graph_topk < dynamic_adj.size(-1):
+            topk_values, topk_indices = torch.topk(dynamic_adj, k=self.dynamic_graph_topk, dim=-1)
+            sparse_adj = torch.zeros_like(dynamic_adj)
+            dynamic_adj = sparse_adj.scatter(-1, topk_indices, topk_values)
+            dynamic_adj = dynamic_adj / dynamic_adj.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        return dynamic_adj
+
+    def build_dynamic_cheb_polynomials(self, x, adj_for_run=None):
+        batch_size, num_nodes = x.size(0), x.size(1)
+        static_adj = self._prepare_static_adj(adj_for_run, batch_size, x.device, x.dtype)
+        dynamic_adj = self._build_dynamic_adj(x)
+        context_summary = x.mean(dim=(1, 3))
+        static_lambda = torch.sigmoid(self.dynamic_lambda_gate(context_summary)).view(batch_size, 1, 1)
+        mixed_adj = static_lambda * static_adj + (1.0 - static_lambda) * dynamic_adj
+        degree = mixed_adj.sum(dim=-1)
+        eye = torch.eye(num_nodes, device=x.device, dtype=x.dtype).unsqueeze(0).expand(batch_size, -1, -1)
+        laplacian = torch.diag_embed(degree) - mixed_adj
+        supports = [eye, laplacian]
+        for order in range(2, self.K):
+            supports.append(2 * torch.matmul(laplacian, supports[order - 1]) - supports[order - 2])
+        return supports[: self.K]
+
+    def build_dynamic_residual_cheb_polynomials(self, x):
+        batch_size, num_nodes = x.size(0), x.size(1)
+        dynamic_adj = self._build_dynamic_adj(x)
+        degree = dynamic_adj.sum(dim=-1)
+        eye = torch.eye(num_nodes, device=x.device, dtype=x.dtype).unsqueeze(0).expand(batch_size, -1, -1)
+        laplacian = torch.diag_embed(degree) - dynamic_adj
+        supports = [eye, laplacian]
+        for order in range(2, self.K):
+            supports.append(2 * torch.matmul(laplacian, supports[order - 1]) - supports[order - 2])
+        return supports[: self.K]
+
+    def forward(self, x, cheb_polynomials=None, adj_for_run=None):
         '''
         Chebyshev graph convolution operation
         :param x: (batch_size, N, F_in, T)
         :return: (batch_size, N, F_out, T)
         '''
 
-        if cheb_polynomials is None:
+        if self.use_dynamic_graph:
+            cheb_polynomials = self.build_dynamic_cheb_polynomials(x, adj_for_run=adj_for_run)
+        elif cheb_polynomials is None:
             cheb_polynomials = self.build_cheb_polynomials(self.fusiongraph())
 
         theta = torch.stack(list(self.Theta), dim=0).to(device=x.device, dtype=x.dtype)
         supports = torch.stack(
             [poly.to(device=x.device, dtype=x.dtype) for poly in cheb_polynomials[: self.K]],
-            dim=0,
+            dim=1 if self.use_dynamic_graph else 0,
         )
         # Original implementation looped over every history step. This einsum
         # keeps the same right-multiplied graph convention while processing the
@@ -905,9 +1001,26 @@ class cheb_conv(nn.Module):
             context_summary = x.mean(dim=(1, 3))
             support_logits = self.support_gate(context_summary)
             support_weights = torch.softmax(support_logits / max(self.support_gate_temperature, 1e-6), dim=-1)
-            output = torch.einsum('bmct,kmn,kco,bk->bnot', x, supports, theta, support_weights)
+            if self.use_dynamic_graph:
+                output = torch.einsum('bmct,bkmn,kco,bk->bnot', x, supports, theta, support_weights)
+            else:
+                output = torch.einsum('bmct,kmn,kco,bk->bnot', x, supports, theta, support_weights)
         else:
-            output = torch.einsum('bmct,kmn,kco->bnot', x, supports, theta)
+            if self.use_dynamic_graph:
+                output = torch.einsum('bmct,bkmn,kco->bnot', x, supports, theta)
+            else:
+                output = torch.einsum('bmct,kmn,kco->bnot', x, supports, theta)
+        if self.use_dynamic_graph_residual:
+            dynamic_supports = torch.stack(
+                [
+                    poly.to(device=x.device, dtype=x.dtype)
+                    for poly in self.build_dynamic_residual_cheb_polynomials(x)
+                ],
+                dim=1,
+            )
+            dynamic_output = torch.einsum('bmct,bkmn,kco->bnot', x, dynamic_supports, theta)
+            beta = torch.clamp(self.dynamic_residual_beta.to(device=x.device, dtype=x.dtype), min=0.0)
+            output = output + beta * dynamic_output
         return F.relu(output)
 
 
@@ -965,6 +1078,134 @@ class CausalMultiScaleTemporalMixer(nn.Module):
         return self.dropout(fused)
 
 
+class HorizonAwarePredictionHead(nn.Module):
+    def __init__(
+        self,
+        input_time_steps,
+        hidden_dim,
+        num_for_predict,
+        out_dim=1,
+        head_hidden_dim=64,
+        horizon_embed_dim=8,
+        dropout=0.1,
+    ):
+        super(HorizonAwarePredictionHead, self).__init__()
+        self.num_for_predict = int(num_for_predict)
+        self.out_dim = int(out_dim)
+        head_hidden_dim = max(int(head_hidden_dim), 1)
+        horizon_embed_dim = max(int(horizon_embed_dim), 1)
+        self.shared_state_proj = nn.Conv2d(
+            int(input_time_steps),
+            head_hidden_dim,
+            kernel_size=(1, int(hidden_dim)),
+        )
+        self.horizon_embedding = nn.Embedding(self.num_for_predict, horizon_embed_dim)
+        self.decoder = nn.Sequential(
+            nn.LayerNorm(head_hidden_dim + horizon_embed_dim),
+            nn.Linear(head_hidden_dim + horizon_embed_dim, head_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(head_hidden_dim, self.out_dim),
+        )
+
+    def forward(self, x):
+        # x: (B, N, F, T). The shared projection keeps the temporal summary
+        # common, while horizon embeddings specialize the final mapping.
+        decoder_x = x.permute(0, 3, 1, 2)
+        state = self.shared_state_proj(decoder_x).squeeze(-1).permute(0, 2, 1)
+        batch_size, num_nodes, _ = state.shape
+        horizon_ids = torch.arange(self.num_for_predict, device=x.device, dtype=torch.long)
+        horizon_emb = self.horizon_embedding(horizon_ids)
+        state = state.unsqueeze(1).expand(-1, self.num_for_predict, -1, -1)
+        horizon_emb = horizon_emb.view(1, self.num_for_predict, 1, -1).expand(
+            batch_size,
+            -1,
+            num_nodes,
+            -1,
+        )
+        output = self.decoder(torch.cat([state, horizon_emb], dim=-1))
+        return output
+
+
+class HorizonAwareResidualCorrectionHead(nn.Module):
+    """Predict a small horizon-aware residual delta on top of a base forecast."""
+
+    def __init__(
+        self,
+        hidden_dim,
+        num_for_predict,
+        out_dim=1,
+        head_hidden_dim=64,
+        horizon_embed_dim=8,
+        anchor_embed_dim=8,
+        dropout=0.1,
+        init_residual=0.05,
+        use_anchor=True,
+    ):
+        super(HorizonAwareResidualCorrectionHead, self).__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.num_for_predict = int(num_for_predict)
+        self.out_dim = int(out_dim)
+        self.use_anchor = bool(use_anchor)
+        head_hidden_dim = max(int(head_hidden_dim), 1)
+        horizon_embed_dim = max(int(horizon_embed_dim), 1)
+        anchor_embed_dim = max(int(anchor_embed_dim), 1)
+
+        self.correction_alpha = nn.Parameter(torch.tensor(float(init_residual), dtype=torch.float32))
+        if self.use_anchor:
+            self.anchor_embedding = nn.Embedding(24, anchor_embed_dim)
+            anchor_dim = anchor_embed_dim
+        else:
+            self.anchor_embedding = None
+            anchor_dim = 0
+        self.horizon_embedding = nn.Embedding(self.num_for_predict, horizon_embed_dim)
+
+        correction_input_dim = self.hidden_dim + self.out_dim + anchor_dim + horizon_embed_dim
+        self.output_proj = nn.Sequential(
+            nn.LayerNorm(correction_input_dim),
+            nn.Linear(correction_input_dim, head_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(head_hidden_dim, self.out_dim),
+        )
+        nn.init.zeros_(self.output_proj[-1].weight)
+        nn.init.zeros_(self.output_proj[-1].bias)
+
+    def forward(self, hidden_sequence, base_output, anchor_hours=None):
+        # hidden_sequence: (B, N, D, T), base_output: (B, H, N, O)
+        batch_size, num_nodes, _, _ = hidden_sequence.shape
+        hidden_state = hidden_sequence[:, :, :, -1]  # (B, N, D)
+        hidden_state = hidden_state.unsqueeze(1).expand(-1, self.num_for_predict, -1, -1)
+
+        pieces = [hidden_state]
+
+        if self.use_anchor:
+            if anchor_hours is None:
+                anchor_ids = torch.zeros(batch_size, dtype=torch.long, device=hidden_sequence.device)
+            else:
+                anchor_ids = anchor_hours.to(device=hidden_sequence.device, dtype=torch.long).view(-1).clamp(min=0, max=23)
+            anchor_emb = self.anchor_embedding(anchor_ids)
+            anchor_emb = anchor_emb.view(batch_size, 1, 1, -1).expand(
+                batch_size,
+                self.num_for_predict,
+                num_nodes,
+                -1,
+            )
+            pieces.append(anchor_emb)
+
+        horizon_ids = torch.arange(self.num_for_predict, device=hidden_sequence.device, dtype=torch.long)
+        horizon_emb = self.horizon_embedding(horizon_ids).view(1, self.num_for_predict, 1, -1)
+        horizon_emb = horizon_emb.expand(batch_size, -1, num_nodes, -1)
+        pieces.append(horizon_emb)
+
+        pieces.append(base_output)
+        correction_input = torch.cat(pieces, dim=-1)
+        delta = self.output_proj(correction_input.reshape(-1, correction_input.size(-1)))
+        delta = delta.view(batch_size, self.num_for_predict, num_nodes, self.out_dim)
+        correction_alpha = torch.clamp(self.correction_alpha, min=0.0)
+        return base_output + correction_alpha * delta
+
+
 class MSTGCN_block(nn.Module):
 
     def __init__(
@@ -987,6 +1228,12 @@ class MSTGCN_block(nn.Module):
         backbone_temporal_gate_hidden_dim=32,
         backbone_branch_gate=False,
         backbone_branch_gate_hidden_dim=32,
+        backbone_dynamic_graph=False,
+        backbone_dynamic_graph_hidden_dim=32,
+        backbone_dynamic_graph_topk=20,
+        backbone_dynamic_graph_init_lambda=0.8,
+        backbone_dynamic_graph_residual=False,
+        backbone_dynamic_graph_residual_init=0.01,
     ):
         super(MSTGCN_block, self).__init__()
         time_kernel_size = int(time_kernel_size)
@@ -994,6 +1241,7 @@ class MSTGCN_block(nn.Module):
         self.use_backbone_adaptive_graph = bool(backbone_adaptive_graph)
         self.use_backbone_multiscale_temporal = bool(backbone_multiscale_temporal)
         self.use_backbone_branch_gate = bool(backbone_branch_gate)
+        self.use_backbone_dynamic_graph = bool(backbone_dynamic_graph)
         self.cheb_conv = cheb_conv(
             K,
             fusiongraph,
@@ -1003,6 +1251,12 @@ class MSTGCN_block(nn.Module):
             adaptive_support_gate=self.use_backbone_adaptive_graph,
             support_gate_hidden_dim=backbone_support_gate_hidden_dim,
             support_gate_temperature=backbone_support_gate_temperature,
+            dynamic_graph=self.use_backbone_dynamic_graph,
+            dynamic_graph_hidden_dim=backbone_dynamic_graph_hidden_dim,
+            dynamic_graph_topk=backbone_dynamic_graph_topk,
+            dynamic_graph_init_lambda=backbone_dynamic_graph_init_lambda,
+            dynamic_graph_residual=backbone_dynamic_graph_residual,
+            dynamic_graph_residual_init=backbone_dynamic_graph_residual_init,
         )
         self.graph_proj = nn.Conv2d(nb_chev_filter, nb_time_filter, kernel_size=(1, 1), stride=(1, 1))
         if self.use_backbone_multiscale_temporal:
@@ -1043,13 +1297,17 @@ class MSTGCN_block(nn.Module):
         else:
             self.channel_attention = nn.Identity()
 
-    def forward(self, x, cheb_polynomials=None):
+    def forward(self, x, cheb_polynomials=None, adj_for_run=None):
         '''
         :param x: (batch_size, N, F_in, T)
         :return: (batch_size, N, nb_time_filter, T)
         '''
         # cheb gcn
-        spatial_gcn = self.cheb_conv(x, cheb_polynomials=cheb_polynomials)  # (b,N,F,T)
+        spatial_gcn = self.cheb_conv(
+            x,
+            cheb_polynomials=cheb_polynomials,
+            adj_for_run=adj_for_run,
+        )  # (b,N,F,T)
 
         spatial_gcn_c = spatial_gcn.permute(0, 2, 1, 3)  # (b,F,N,T)
         x_residual = self.residual_conv(x.permute(0, 2, 1, 3))  # (b,F,N,T)
@@ -1071,6 +1329,170 @@ class MSTGCN_block(nn.Module):
         x_residual = self.channel_attention(x_residual)
 
         return x_residual
+
+
+class BranchFusionHead(nn.Module):
+    """Context-aware fusion over full prediction candidates."""
+
+    def __init__(
+        self,
+        context_channels,
+        num_branches,
+        hidden_dim=32,
+        dropout=0.0,
+        init_main_bias=2.0,
+    ):
+        super().__init__()
+        self.num_branches = int(num_branches)
+        hidden_dim = max(int(hidden_dim), 1)
+        self.gate = nn.Sequential(
+            nn.LayerNorm(int(context_channels)),
+            nn.Linear(int(context_channels), hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(hidden_dim, self.num_branches),
+        )
+        nn.init.zeros_(self.gate[-1].weight)
+        nn.init.zeros_(self.gate[-1].bias)
+        with torch.no_grad():
+            self.gate[-1].bias[0] = float(init_main_bias)
+
+    def forward(self, context_x, candidates):
+        if len(candidates) != self.num_branches:
+            raise ValueError(
+                "BranchFusionHead expected %d candidates, got %d"
+                % (self.num_branches, len(candidates))
+            )
+        weights = self.branch_weights(context_x)
+        stacked = torch.stack(candidates, dim=1)
+        return (weights.view(weights.size(0), self.num_branches, 1, 1, 1) * stacked).sum(dim=1)
+
+    def branch_weights(self, context_x):
+        context = context_x.mean(dim=(1, 3))
+        return torch.softmax(self.gate(context), dim=-1)
+
+
+class ResidualBranchGateHead(nn.Module):
+    """Anchor/horizon-aware gates for residual correction branches."""
+
+    def __init__(
+        self,
+        context_channels,
+        num_branches,
+        num_for_predict,
+        hidden_dim=32,
+        dropout=0.0,
+        init_gate=0.95,
+        anchor_embed_dim=8,
+        horizon_embed_dim=4,
+        branch_embed_dim=4,
+        use_anchor=True,
+    ):
+        super().__init__()
+        self.num_branches = int(num_branches)
+        self.num_for_predict = int(num_for_predict)
+        self.use_anchor = bool(use_anchor)
+        hidden_dim = max(int(hidden_dim), 1)
+        anchor_embed_dim = max(int(anchor_embed_dim), 1)
+        horizon_embed_dim = max(int(horizon_embed_dim), 1)
+        branch_embed_dim = max(int(branch_embed_dim), 1)
+
+        if self.use_anchor:
+            self.anchor_embedding = nn.Embedding(24, anchor_embed_dim)
+            anchor_dim = anchor_embed_dim
+        else:
+            self.anchor_embedding = None
+            anchor_dim = 0
+        self.horizon_embedding = nn.Embedding(self.num_for_predict, horizon_embed_dim)
+        self.branch_embedding = nn.Embedding(self.num_branches, branch_embed_dim)
+
+        gate_input_dim = int(context_channels) + anchor_dim + horizon_embed_dim + branch_embed_dim
+        self.gate = nn.Sequential(
+            nn.LayerNorm(gate_input_dim),
+            nn.Linear(gate_input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(hidden_dim, 1),
+        )
+        init_gate = min(max(float(init_gate), 1e-4), 1.0 - 1e-4)
+        nn.init.zeros_(self.gate[-1].weight)
+        nn.init.constant_(self.gate[-1].bias, math.log(init_gate / (1.0 - init_gate)))
+
+    def forward(self, context_x, anchor_hours=None):
+        batch_size = context_x.size(0)
+        context = context_x.mean(dim=(1, 3))
+        context = context.view(batch_size, 1, 1, -1).expand(
+            batch_size,
+            self.num_branches,
+            self.num_for_predict,
+            -1,
+        )
+
+        pieces = [context]
+        if self.use_anchor:
+            if anchor_hours is None:
+                anchor_ids = torch.zeros(batch_size, dtype=torch.long, device=context_x.device)
+            else:
+                anchor_ids = anchor_hours.to(device=context_x.device, dtype=torch.long).view(-1).clamp(min=0, max=23)
+            anchor_emb = self.anchor_embedding(anchor_ids)
+            anchor_emb = anchor_emb.view(batch_size, 1, 1, -1).expand(
+                batch_size,
+                self.num_branches,
+                self.num_for_predict,
+                -1,
+            )
+            pieces.append(anchor_emb)
+
+        horizon_ids = torch.arange(self.num_for_predict, device=context_x.device, dtype=torch.long)
+        horizon_emb = self.horizon_embedding(horizon_ids).view(1, 1, self.num_for_predict, -1)
+        horizon_emb = horizon_emb.expand(batch_size, self.num_branches, self.num_for_predict, -1)
+        pieces.append(horizon_emb)
+
+        branch_ids = torch.arange(self.num_branches, device=context_x.device, dtype=torch.long)
+        branch_emb = self.branch_embedding(branch_ids).view(1, self.num_branches, 1, -1)
+        branch_emb = branch_emb.expand(batch_size, self.num_branches, self.num_for_predict, -1)
+        pieces.append(branch_emb)
+
+        gate_input = torch.cat(pieces, dim=-1)
+        gate = self.gate(gate_input.reshape(-1, gate_input.size(-1)))
+        return torch.sigmoid(gate).view(batch_size, self.num_branches, self.num_for_predict)
+
+
+class AnchorResidualScale(nn.Module):
+    """Conservative anchor-hour scale for a residual branch."""
+
+    def __init__(self, init_scale=1.0, max_delta=0.2, anchor_hours=None):
+        super().__init__()
+        self.max_delta = float(max_delta)
+        if self.max_delta <= 0:
+            raise ValueError("max_delta must be > 0.")
+        anchor_mask = torch.zeros(24, dtype=torch.float32)
+        if anchor_hours:
+            for hour in anchor_hours:
+                hour = int(hour)
+                if hour < 0 or hour > 23:
+                    raise ValueError("anchor hour values must be within [0, 23].")
+                anchor_mask[hour] = 1.0
+        else:
+            anchor_mask.fill_(1.0)
+        self.register_buffer("anchor_mask", anchor_mask)
+
+        bounded = (float(init_scale) - 1.0) / self.max_delta
+        bounded = min(max(bounded, -0.999), 0.999)
+        initial_logit = 0.5 * math.log((1.0 + bounded) / (1.0 - bounded))
+        self.scale_logit = nn.Parameter(torch.full((24,), float(initial_logit), dtype=torch.float32))
+
+    def forward(self, residual, anchor_hours=None):
+        batch_size = residual.size(0)
+        if anchor_hours is None:
+            anchor_ids = torch.zeros(batch_size, dtype=torch.long, device=residual.device)
+        else:
+            anchor_ids = anchor_hours.to(device=residual.device, dtype=torch.long).view(-1).clamp(min=0, max=23)
+        scale = 1.0 + self.anchor_mask.to(residual.device, residual.dtype) * self.max_delta * torch.tanh(
+            self.scale_logit.to(device=residual.device, dtype=residual.dtype)
+        )
+        scale = scale.index_select(0, anchor_ids).view(batch_size, 1, 1, 1)
+        return residual * scale
 
 
 class MSTGCN_submodule(nn.Module):
@@ -1100,6 +1522,10 @@ class MSTGCN_submodule(nn.Module):
         trend_attention_heads=4,
         trend_dropout=0.1,
         horizon_specific_prediction_head=False,
+        horizon_aware_prediction_head=False,
+        horizon_head_hidden_dim=64,
+        horizon_head_embed_dim=8,
+        horizon_head_dropout=0.1,
         horizon_graph_fusion_decoder=False,
         horizon_graph_decoder_residual=0.2,
         ast_tcn_residual=False,
@@ -1158,6 +1584,10 @@ class MSTGCN_submodule(nn.Module):
         stgformer_spatial_edge_bias=True,
         stgformer_spatial_edge_bias_init=0.05,
         stgformer_spatial_edge_bias_eps=1e-6,
+        stgformer_anchor_residual_scale=False,
+        stgformer_anchor_residual_init=1.0,
+        stgformer_anchor_residual_max_delta=0.2,
+        stgformer_anchor_residual_hours=None,
         backbone_adaptive_graph=False,
         backbone_support_gate_hidden_dim=32,
         backbone_support_gate_temperature=1.0,
@@ -1166,6 +1596,31 @@ class MSTGCN_submodule(nn.Module):
         backbone_temporal_gate_hidden_dim=32,
         backbone_branch_gate=False,
         backbone_branch_gate_hidden_dim=32,
+        backbone_dynamic_graph=False,
+        backbone_dynamic_graph_hidden_dim=32,
+        backbone_dynamic_graph_topk=20,
+        backbone_dynamic_graph_init_lambda=0.8,
+        backbone_dynamic_graph_residual=False,
+        backbone_dynamic_graph_residual_init=0.01,
+        branch_fusion=False,
+        branch_fusion_hidden_dim=32,
+        branch_fusion_dropout=0.0,
+        branch_fusion_init_main_bias=2.0,
+        residual_gate_fusion=False,
+        residual_gate_hidden_dim=32,
+        residual_gate_dropout=0.0,
+        residual_gate_init=0.95,
+        residual_gate_anchor_embed_dim=8,
+        residual_gate_horizon_embed_dim=4,
+        residual_gate_branch_embed_dim=4,
+        residual_gate_use_anchor=True,
+        residual_correction_head=False,
+        residual_correction_hidden_dim=64,
+        residual_correction_horizon_embed_dim=8,
+        residual_correction_anchor_embed_dim=8,
+        residual_correction_dropout=0.1,
+        residual_correction_init=0.05,
+        residual_correction_use_anchor=True,
     ):
 
 
@@ -1228,6 +1683,12 @@ class MSTGCN_submodule(nn.Module):
                 backbone_temporal_gate_hidden_dim=backbone_temporal_gate_hidden_dim,
                 backbone_branch_gate=backbone_branch_gate,
                 backbone_branch_gate_hidden_dim=backbone_branch_gate_hidden_dim,
+                backbone_dynamic_graph=backbone_dynamic_graph,
+                backbone_dynamic_graph_hidden_dim=backbone_dynamic_graph_hidden_dim,
+                backbone_dynamic_graph_topk=backbone_dynamic_graph_topk,
+                backbone_dynamic_graph_init_lambda=backbone_dynamic_graph_init_lambda,
+                backbone_dynamic_graph_residual=backbone_dynamic_graph_residual,
+                backbone_dynamic_graph_residual_init=backbone_dynamic_graph_residual_init,
             )
         ])
 
@@ -1251,12 +1712,19 @@ class MSTGCN_submodule(nn.Module):
                 backbone_temporal_gate_hidden_dim=backbone_temporal_gate_hidden_dim,
                 backbone_branch_gate=backbone_branch_gate,
                 backbone_branch_gate_hidden_dim=backbone_branch_gate_hidden_dim,
+                backbone_dynamic_graph=backbone_dynamic_graph,
+                backbone_dynamic_graph_hidden_dim=backbone_dynamic_graph_hidden_dim,
+                backbone_dynamic_graph_topk=backbone_dynamic_graph_topk,
+                backbone_dynamic_graph_init_lambda=backbone_dynamic_graph_init_lambda,
+                backbone_dynamic_graph_residual=backbone_dynamic_graph_residual,
+                backbone_dynamic_graph_residual_init=backbone_dynamic_graph_residual_init,
             )
             for _ in range(nb_block - 1)
         ])
 
         self.use_trend_alignment_decoder = bool(trend_alignment_decoder)
         self.use_horizon_specific_prediction_head = bool(horizon_specific_prediction_head)
+        self.use_horizon_aware_prediction_head = bool(horizon_aware_prediction_head)
         if self.use_trend_alignment_decoder:
             self.trend_decoder = TrendAlignmentDecoder(
                 hidden_dim=nb_time_filter,
@@ -1269,6 +1737,16 @@ class MSTGCN_submodule(nn.Module):
                 time_embed_dim=trend_time_embed_dim,
                 attention_heads=trend_attention_heads,
                 dropout=trend_dropout,
+            )
+        elif self.use_horizon_aware_prediction_head:
+            self.horizon_aware_head = HorizonAwarePredictionHead(
+                input_time_steps=int(len_input / time_strides),
+                hidden_dim=nb_time_filter,
+                num_for_predict=num_for_predict,
+                out_dim=out_dim,
+                head_hidden_dim=horizon_head_hidden_dim,
+                horizon_embed_dim=horizon_head_embed_dim,
+                dropout=horizon_head_dropout,
             )
         elif self.use_horizon_specific_prediction_head:
             self.horizon_final_convs = nn.ModuleList([
@@ -1371,6 +1849,82 @@ class MSTGCN_submodule(nn.Module):
                 spatial_edge_bias_init=stgformer_spatial_edge_bias_init,
                 spatial_edge_bias_eps=stgformer_spatial_edge_bias_eps,
             )
+        self.use_stgformer_anchor_residual_scale = bool(stgformer_anchor_residual_scale)
+        if self.use_stgformer_anchor_residual_scale:
+            if not self.use_stgformer_temporal_residual:
+                raise ValueError("stgformer_anchor_residual_scale requires stgformer_temporal_residual.")
+            self.stgformer_anchor_residual_scale = AnchorResidualScale(
+                init_scale=stgformer_anchor_residual_init,
+                max_delta=stgformer_anchor_residual_max_delta,
+                anchor_hours=stgformer_anchor_residual_hours,
+            )
+        else:
+            self.stgformer_anchor_residual_scale = None
+
+        self.use_branch_fusion = bool(branch_fusion)
+        self.branch_fusion_branch_names = ["graph"]
+        if self.use_ast_tcn_residual:
+            self.branch_fusion_branch_names.append("ast_tcn")
+        if self.use_sthybrid_ms_residual:
+            self.branch_fusion_branch_names.append("sthybrid")
+        if self.use_stgformer_temporal_residual:
+            self.branch_fusion_branch_names.append("stgformer")
+        if self.use_branch_fusion:
+            if len(self.branch_fusion_branch_names) <= 1:
+                raise ValueError("branch_fusion requires at least one residual branch.")
+            self.branch_fusion_head = BranchFusionHead(
+                context_channels=effective_in_channels,
+                num_branches=len(self.branch_fusion_branch_names),
+                hidden_dim=branch_fusion_hidden_dim,
+                dropout=branch_fusion_dropout,
+                init_main_bias=branch_fusion_init_main_bias,
+            )
+        else:
+            self.branch_fusion_head = None
+
+        self.use_residual_gate_fusion = bool(residual_gate_fusion)
+        self.residual_gate_branch_names = []
+        if self.use_ast_tcn_residual:
+            self.residual_gate_branch_names.append("ast_tcn")
+        if self.use_sthybrid_ms_residual:
+            self.residual_gate_branch_names.append("sthybrid")
+        if self.use_stgformer_temporal_residual:
+            self.residual_gate_branch_names.append("stgformer")
+        if self.use_residual_gate_fusion:
+            if self.use_branch_fusion:
+                raise ValueError("residual_gate_fusion cannot be combined with branch_fusion.")
+            if len(self.residual_gate_branch_names) <= 0:
+                raise ValueError("residual_gate_fusion requires at least one residual branch.")
+            self.residual_gate_head = ResidualBranchGateHead(
+                context_channels=effective_in_channels,
+                num_branches=len(self.residual_gate_branch_names),
+                num_for_predict=num_for_predict,
+                hidden_dim=residual_gate_hidden_dim,
+                dropout=residual_gate_dropout,
+                init_gate=residual_gate_init,
+                anchor_embed_dim=residual_gate_anchor_embed_dim,
+                horizon_embed_dim=residual_gate_horizon_embed_dim,
+                branch_embed_dim=residual_gate_branch_embed_dim,
+                use_anchor=residual_gate_use_anchor,
+            )
+        else:
+            self.residual_gate_head = None
+
+        self.use_residual_correction_head = bool(residual_correction_head)
+        if self.use_residual_correction_head:
+            self.residual_correction_head = HorizonAwareResidualCorrectionHead(
+                hidden_dim=nb_time_filter,
+                num_for_predict=num_for_predict,
+                out_dim=out_dim,
+                head_hidden_dim=residual_correction_hidden_dim,
+                horizon_embed_dim=residual_correction_horizon_embed_dim,
+                anchor_embed_dim=residual_correction_anchor_embed_dim,
+                dropout=residual_correction_dropout,
+                init_residual=residual_correction_init,
+                use_anchor=residual_correction_use_anchor,
+            )
+        else:
+            self.residual_correction_head = None
 
         self.DEVICE = DEVICE
         self.num_for_predict = num_for_predict
@@ -1392,10 +1946,13 @@ class MSTGCN_submodule(nn.Module):
         branch_x = x
 
         adj_for_run = self.fusiongraph(context_x, anchor_hours=anchor_hours)
-        cheb_polynomials = self.BlockList[0].cheb_conv.build_cheb_polynomials(adj_for_run)
+        if any(getattr(block, "use_backbone_dynamic_graph", False) for block in self.BlockList):
+            cheb_polynomials = None
+        else:
+            cheb_polynomials = self.BlockList[0].cheb_conv.build_cheb_polynomials(adj_for_run)
 
         for block in self.BlockList:
-            x = block(x, cheb_polynomials=cheb_polynomials)
+            x = block(x, cheb_polynomials=cheb_polynomials, adj_for_run=adj_for_run)
 
         if self.use_trend_alignment_decoder:
             output = self.trend_decoder(x, context_x)
@@ -1422,6 +1979,8 @@ class MSTGCN_submodule(nn.Module):
                 horizon_output = horizon_all[:, horizon_idx].permute(0, 2, 1).unsqueeze(1)
                 horizon_outputs.append(horizon_output)
             output = torch.cat(horizon_outputs, dim=1)
+        elif self.use_horizon_aware_prediction_head:
+            output = self.horizon_aware_head(x)
         elif self.use_horizon_specific_prediction_head:
             decoder_x = x.permute(0, 3, 1, 2)
             horizon_outputs = []
@@ -1436,21 +1995,64 @@ class MSTGCN_submodule(nn.Module):
             output = output.view(batch_size, self.num_for_predict, self.out_dim, num_nodes)
             output = output.permute(0, 1, 3, 2)
 
+        branch_weights = None
+        residual_branch_index = 1
+        if self.use_branch_fusion:
+            branch_weights = self.branch_fusion_head.branch_weights(branch_x)
+        residual_gates = None
+        residual_gate_index = 0
+        if self.use_residual_gate_fusion:
+            residual_gates = self.residual_gate_head(branch_x, anchor_hours=anchor_hours)
         if self.use_ast_tcn_residual:
             hgaurban_adj = (
                 self.hgaurban_edge_bias_matrix.to(device=branch_x.device, dtype=branch_x.dtype)
                 if self.use_ast_tcn_hgaurban_edge_bias
                 else None
             )
-            output = output + self.ast_tcn_branch(
+            ast_residual = self.ast_tcn_branch(
                 branch_x,
                 adj_for_run=adj_for_run,
                 anchor_hours=anchor_hours,
                 hgaurban_adj=hgaurban_adj,
             )
+            if self.use_branch_fusion:
+                output = output + branch_weights[:, residual_branch_index].view(-1, 1, 1, 1) * ast_residual
+                residual_branch_index += 1
+            elif self.use_residual_gate_fusion:
+                gate = residual_gates[:, residual_gate_index].view(-1, self.num_for_predict, 1, 1)
+                output = output + gate * ast_residual
+                residual_gate_index += 1
+            else:
+                output = output + ast_residual
         if self.use_sthybrid_ms_residual:
-            output = output + self.sthybrid_ms_branch(branch_x, adj_for_run=adj_for_run)
+            sthybrid_residual = self.sthybrid_ms_branch(branch_x, adj_for_run=adj_for_run)
+            if self.use_branch_fusion:
+                output = output + branch_weights[:, residual_branch_index].view(-1, 1, 1, 1) * sthybrid_residual
+                residual_branch_index += 1
+            elif self.use_residual_gate_fusion:
+                gate = residual_gates[:, residual_gate_index].view(-1, self.num_for_predict, 1, 1)
+                output = output + gate * sthybrid_residual
+                residual_gate_index += 1
+            else:
+                output = output + sthybrid_residual
         if self.use_stgformer_temporal_residual:
-            output = output + self.stgformer_temporal_branch(branch_x, adj_for_run=adj_for_run)
+            stgformer_residual = self.stgformer_temporal_branch(branch_x, adj_for_run=adj_for_run)
+            if self.use_stgformer_anchor_residual_scale:
+                stgformer_residual = self.stgformer_anchor_residual_scale(
+                    stgformer_residual,
+                    anchor_hours=anchor_hours,
+                )
+            if self.use_branch_fusion:
+                output = output + branch_weights[:, residual_branch_index].view(-1, 1, 1, 1) * stgformer_residual
+                residual_branch_index += 1
+            elif self.use_residual_gate_fusion:
+                gate = residual_gates[:, residual_gate_index].view(-1, self.num_for_predict, 1, 1)
+                output = output + gate * stgformer_residual
+                residual_gate_index += 1
+            else:
+                output = output + stgformer_residual
+
+        if self.use_residual_correction_head:
+            output = self.residual_correction_head(x, output, anchor_hours=anchor_hours)
 
         return output

@@ -55,7 +55,14 @@ from datasets.bike import Bike, BikeGraph
 from models.D2STGNN import D2STGNNFusionBackbone
 from models.MSTGCN import MSTGCN_submodule
 from models.fusiongraph import FusionGraphModel
-from util import LightningMetric, masked_huber, masked_mae
+from util import LightningMetric, cumulative_net_flow_mae, masked_huber, masked_mae
+from demand_bucket_utils import (
+    build_torch_demand_weights,
+    compute_channel_quantile_thresholds,
+    directional_demand_penalties,
+    validate_bucket_spec,
+    weighted_point_loss,
+)
 from analysis_result_utils import build_analysis_task_dir, build_and_save_analysis_registry, ensure_analysis_dir
 
 
@@ -118,6 +125,56 @@ parser.add_argument(
 )
 parser.add_argument('--loss', choices=['mae', 'huber'], default='huber')
 parser.add_argument('--huber_delta', type=float, default=3.0)
+parser.add_argument(
+    '--demand_bucket_weighting',
+    default='false',
+    help=(
+        "Use 'true' to weight the training point loss by target-demand buckets. "
+        'Bucket thresholds are always computed from the loaded training split.'
+    ),
+)
+parser.add_argument(
+    '--demand_bucket_quantiles',
+    default='0.5,0.8,0.95',
+    help='Strictly increasing training-target quantiles used as demand-bucket boundaries.',
+)
+parser.add_argument(
+    '--demand_bucket_weights',
+    default='1.0,1.0,1.15,1.3',
+    help='One positive loss weight per demand bucket; count must equal quantile count + 1.',
+)
+parser.add_argument(
+    '--directional_demand_loss',
+    default='false',
+    help=(
+        "Use 'true' to add training-only low-over, high-under, and peak-under penalties. "
+        'Validation/test losses remain the original unweighted objective.'
+    ),
+)
+parser.add_argument('--directional_low_over_weight', type=float, default=0.05)
+parser.add_argument('--directional_high_under_weight', type=float, default=0.05)
+parser.add_argument('--directional_peak_under_weight', type=float, default=0.10)
+parser.add_argument(
+    '--net_flow_consistency_weight',
+    type=float,
+    default=0.0,
+    help=(
+        'Weight for cumulative net-flow consistency loss. '
+        '0 disables it and reproduces the original training objective.'
+    ),
+)
+parser.add_argument(
+    '--net_flow_out_index',
+    type=int,
+    default=0,
+    help='Target-channel index for outflow when cumulative net-flow loss is enabled.',
+)
+parser.add_argument(
+    '--net_flow_in_index',
+    type=int,
+    default=1,
+    help='Target-channel index for inflow when cumulative net-flow loss is enabled.',
+)
 parser.add_argument('--peak_anchor_loss_weight', type=float, default=1.0)
 parser.add_argument(
     '--peak_anchor_hours',
@@ -262,6 +319,31 @@ parser.add_argument('--backbone_temporal_dilations', default='1,2,4', help="Comm
 parser.add_argument('--backbone_temporal_gate_hidden_dim', type=int, default=32)
 parser.add_argument('--backbone_branch_gate', default='false', help="Use 'true' or 'false' to learn a branch gate over graph, temporal, and residual backbone paths.")
 parser.add_argument('--backbone_branch_gate_hidden_dim', type=int, default=32)
+parser.add_argument('--backbone_dynamic_graph', default='false', help="Use 'true' or 'false' to blend fused static graph with a sample-wise dynamic graph inside MSTGCN blocks.")
+parser.add_argument('--backbone_dynamic_graph_hidden_dim', type=int, default=32)
+parser.add_argument('--backbone_dynamic_graph_topk', type=int, default=20)
+parser.add_argument('--backbone_dynamic_graph_init_lambda', type=float, default=0.8, help='Initial static graph weight in A_eff=lambda*A_static+(1-lambda)*A_dyn.')
+parser.add_argument('--backbone_dynamic_graph_residual', default='false', help="Use 'true' or 'false' to add a weak dynamic-graph residual correction after the static graph convolution.")
+parser.add_argument('--backbone_dynamic_graph_residual_init', type=float, default=0.01)
+parser.add_argument('--branch_fusion', default='false', help="Use 'true' or 'false' to fuse graph/residual prediction candidates with a context-aware softmax gate.")
+parser.add_argument('--branch_fusion_hidden_dim', type=int, default=32)
+parser.add_argument('--branch_fusion_dropout', type=float, default=0.0)
+parser.add_argument('--branch_fusion_init_main_bias', type=float, default=2.0)
+parser.add_argument('--residual_gate_fusion', default='false', help="Use 'true' or 'false' to apply context/anchor/horizon-aware sigmoid gates to residual branches.")
+parser.add_argument('--residual_gate_hidden_dim', type=int, default=32)
+parser.add_argument('--residual_gate_dropout', type=float, default=0.0)
+parser.add_argument('--residual_gate_init', type=float, default=0.95)
+parser.add_argument('--residual_gate_anchor_embed_dim', type=int, default=8)
+parser.add_argument('--residual_gate_horizon_embed_dim', type=int, default=4)
+parser.add_argument('--residual_gate_branch_embed_dim', type=int, default=4)
+parser.add_argument('--residual_gate_use_anchor', default='true', help="Use 'true' or 'false' to include anchor-hour embedding in residual branch gates.")
+parser.add_argument('--residual_correction_head', default='false', help="Use 'true' or 'false' to add a horizon-aware residual correction head on top of the base forecast.")
+parser.add_argument('--residual_correction_hidden_dim', type=int, default=64)
+parser.add_argument('--residual_correction_horizon_embed_dim', type=int, default=8)
+parser.add_argument('--residual_correction_anchor_embed_dim', type=int, default=8)
+parser.add_argument('--residual_correction_dropout', type=float, default=0.1)
+parser.add_argument('--residual_correction_init', type=float, default=0.05)
+parser.add_argument('--residual_correction_use_anchor', default='true', help="Use 'true' or 'false' to include anchor-hour embedding in residual correction.")
 parser.add_argument('--channel_attention', default='false', help="Use 'true' or 'false' to enable channel attention in MSTGCN.")
 parser.add_argument('--channel_attention_reduction', type=int, default=4)
 parser.add_argument('--trend_alignment_decoder', default='false', help="Use 'true' or 'false' to enable the TSTAD-style trend-alignment parallel decoder.")
@@ -275,6 +357,14 @@ parser.add_argument(
     default='false',
     help="Use 'true' to replace the shared final prediction head with one output head per horizon.",
 )
+parser.add_argument(
+    '--horizon_aware_prediction_head',
+    default='false',
+    help="Use 'true' to decode each prediction step with a shared state projection plus horizon embeddings.",
+)
+parser.add_argument('--horizon_head_hidden_dim', type=int, default=64)
+parser.add_argument('--horizon_head_embed_dim', type=int, default=8)
+parser.add_argument('--horizon_head_dropout', type=float, default=0.1)
 parser.add_argument(
     '--horizon_graph_fusion_decoder',
     default='false',
@@ -341,6 +431,10 @@ parser.add_argument('--stgformer_spatial_heads', type=int, default=4)
 parser.add_argument('--stgformer_spatial_edge_bias', default='true', help="Use 'true' to add fused-graph edge weights as spatial-attention score bias in the STGformer branch.")
 parser.add_argument('--stgformer_spatial_edge_bias_init', type=float, default=0.05)
 parser.add_argument('--stgformer_spatial_edge_bias_eps', type=float, default=1e-6)
+parser.add_argument('--stgformer_anchor_residual_scale', default='false', help="Use 'true' to learn conservative anchor-hour scales for the STGformer residual branch.")
+parser.add_argument('--stgformer_anchor_residual_init', type=float, default=1.0)
+parser.add_argument('--stgformer_anchor_residual_max_delta', type=float, default=0.2)
+parser.add_argument('--stgformer_anchor_residual_hours', default='', help="Comma-separated anchor hours whose STGformer residual scale may change. Empty means all anchors.")
 parser.add_argument('--d2_hidden_dim', type=int, default=64)
 parser.add_argument('--d2_num_layers', type=int, default=4)
 parser.add_argument('--d2_dropout', type=float, default=0.1)
@@ -464,6 +558,10 @@ args.horizon_specific_prediction_head = parse_bool_arg(
     args.horizon_specific_prediction_head,
     '--horizon_specific_prediction_head',
 )
+args.horizon_aware_prediction_head = parse_bool_arg(
+    args.horizon_aware_prediction_head,
+    '--horizon_aware_prediction_head',
+)
 args.horizon_graph_fusion_decoder = parse_bool_arg(
     args.horizon_graph_fusion_decoder,
     '--horizon_graph_fusion_decoder',
@@ -491,22 +589,71 @@ args.stgformer_temporal_zero_init = parse_bool_arg(
 )
 args.stgformer_spatial_transformer = parse_bool_arg(args.stgformer_spatial_transformer, '--stgformer_spatial_transformer')
 args.stgformer_spatial_edge_bias = parse_bool_arg(args.stgformer_spatial_edge_bias, '--stgformer_spatial_edge_bias')
+args.stgformer_anchor_residual_scale = parse_bool_arg(args.stgformer_anchor_residual_scale, '--stgformer_anchor_residual_scale')
 args.backbone_adaptive_graph = parse_bool_arg(args.backbone_adaptive_graph, '--backbone_adaptive_graph')
 args.backbone_multiscale_temporal = parse_bool_arg(args.backbone_multiscale_temporal, '--backbone_multiscale_temporal')
 args.backbone_branch_gate = parse_bool_arg(args.backbone_branch_gate, '--backbone_branch_gate')
+args.backbone_dynamic_graph = parse_bool_arg(args.backbone_dynamic_graph, '--backbone_dynamic_graph')
+args.backbone_dynamic_graph_residual = parse_bool_arg(args.backbone_dynamic_graph_residual, '--backbone_dynamic_graph_residual')
+args.branch_fusion = parse_bool_arg(args.branch_fusion, '--branch_fusion')
+args.residual_gate_fusion = parse_bool_arg(args.residual_gate_fusion, '--residual_gate_fusion')
+args.residual_gate_use_anchor = parse_bool_arg(args.residual_gate_use_anchor, '--residual_gate_use_anchor')
+args.residual_correction_head = parse_bool_arg(args.residual_correction_head, '--residual_correction_head')
+args.residual_correction_use_anchor = parse_bool_arg(args.residual_correction_use_anchor, '--residual_correction_use_anchor')
 args.save_checkpoints = parse_bool_arg(args.save_checkpoints, '--save_checkpoints')
 args.channel_attention = parse_bool_arg(args.channel_attention, '--channel_attention')
+args.demand_bucket_weighting = parse_bool_arg(
+    args.demand_bucket_weighting,
+    '--demand_bucket_weighting',
+)
+args.directional_demand_loss = parse_bool_arg(
+    args.directional_demand_loss,
+    '--directional_demand_loss',
+)
 args.d2_adaptive_adj = parse_bool_arg(args.d2_adaptive_adj, '--d2_adaptive_adj')
 args.d2_use_reverse = parse_bool_arg(args.d2_use_reverse, '--d2_use_reverse')
 args.graph_use = parse_graph_use_arg(args.graph_use)
 args.peak_anchor_hours = parse_anchor_hour_list(args.peak_anchor_hours)
 args.train_anchor_hours = parse_anchor_hour_list(args.train_anchor_hours)
+args.demand_bucket_quantiles = parse_float_list(
+    args.demand_bucket_quantiles,
+    '--demand_bucket_quantiles',
+)
+args.demand_bucket_weights = parse_float_list(
+    args.demand_bucket_weights,
+    '--demand_bucket_weights',
+)
+try:
+    args.demand_bucket_quantiles, args.demand_bucket_weights = validate_bucket_spec(
+        args.demand_bucket_quantiles,
+        args.demand_bucket_weights,
+    )
+except ValueError as exc:
+    parser.error(str(exc))
+if args.directional_demand_loss:
+    if len(args.demand_bucket_quantiles) != 3 or not np.allclose(
+        args.demand_bucket_quantiles,
+        [0.5, 0.8, 0.95],
+    ):
+        parser.error(
+            '--directional_demand_loss requires --demand_bucket_quantiles 0.5,0.8,0.95.'
+        )
+    directional_weights = [
+        args.directional_low_over_weight,
+        args.directional_high_under_weight,
+        args.directional_peak_under_weight,
+    ]
+    if any(value < 0 for value in directional_weights):
+        parser.error('Directional demand loss weights must be >= 0.')
+    if not any(value > 0 for value in directional_weights):
+        parser.error('--directional_demand_loss requires at least one positive weight.')
 args.ast_tcn_residual_horizon_mask = parse_float_list(
     args.ast_tcn_residual_horizon_mask,
     '--ast_tcn_residual_horizon_mask',
 )
 args.sthybrid_ms_dilations = parse_int_list(args.sthybrid_ms_dilations, '--sthybrid_ms_dilations')
 args.backbone_temporal_dilations = parse_int_list(args.backbone_temporal_dilations, '--backbone_temporal_dilations')
+args.stgformer_anchor_residual_hours = parse_anchor_hour_list(args.stgformer_anchor_residual_hours)
 
 if args.graph_topk < 0:
     parser.error('--graph_topk must be >= 0.')
@@ -524,6 +671,12 @@ if args.weekday_embed_dim < 0:
     parser.error('--weekday_embed_dim must be >= 0.')
 if args.peak_anchor_loss_weight <= 0:
     parser.error('--peak_anchor_loss_weight must be > 0.')
+if args.net_flow_consistency_weight < 0:
+    parser.error('--net_flow_consistency_weight must be >= 0.')
+if args.net_flow_out_index < 0 or args.net_flow_in_index < 0:
+    parser.error('--net_flow_out_index and --net_flow_in_index must be >= 0.')
+if args.net_flow_consistency_weight > 0 and args.net_flow_out_index == args.net_flow_in_index:
+    parser.error('--net_flow_out_index and --net_flow_in_index must be different.')
 if args.peak_anchor_loss_weight != 1.0 and not args.peak_anchor_hours:
     parser.error('--peak_anchor_loss_weight requires at least one --peak_anchor_hours value.')
 if args.context_gate_hidden_dim <= 0:
@@ -573,12 +726,24 @@ if args.trend_attention_heads <= 0:
     parser.error('--trend_attention_heads must be > 0.')
 if args.trend_alignment_decoder and args.horizon_specific_prediction_head:
     parser.error('--horizon_specific_prediction_head is only supported with the standard final prediction head, not --trend_alignment_decoder.')
+if args.trend_alignment_decoder and args.horizon_aware_prediction_head:
+    parser.error('--horizon_aware_prediction_head is only supported with the standard final prediction head, not --trend_alignment_decoder.')
 if args.trend_alignment_decoder and args.horizon_graph_fusion_decoder:
     parser.error('--horizon_graph_fusion_decoder is only supported with the standard final prediction head, not --trend_alignment_decoder.')
+if args.horizon_specific_prediction_head and args.horizon_aware_prediction_head:
+    parser.error('--horizon_specific_prediction_head and --horizon_aware_prediction_head cannot be combined.')
 if args.horizon_specific_prediction_head and args.horizon_graph_fusion_decoder:
     parser.error('--horizon_graph_fusion_decoder uses the shared final head and cannot be combined with --horizon_specific_prediction_head.')
+if args.horizon_aware_prediction_head and args.horizon_graph_fusion_decoder:
+    parser.error('--horizon_graph_fusion_decoder uses the shared final head and cannot be combined with --horizon_aware_prediction_head.')
 if not (0.0 <= args.horizon_graph_decoder_residual <= 1.0):
     parser.error('--horizon_graph_decoder_residual must be within [0, 1].')
+if args.horizon_head_hidden_dim <= 0:
+    parser.error('--horizon_head_hidden_dim must be > 0.')
+if args.horizon_head_embed_dim <= 0:
+    parser.error('--horizon_head_embed_dim must be > 0.')
+if args.horizon_head_dropout < 0:
+    parser.error('--horizon_head_dropout must be >= 0.')
 if args.ast_tcn_hidden_dim <= 0:
     parser.error('--ast_tcn_hidden_dim must be > 0.')
 if args.ast_tcn_layers <= 0:
@@ -667,6 +832,16 @@ if args.stgformer_spatial_edge_bias_init < 0:
     parser.error('--stgformer_spatial_edge_bias_init must be >= 0.')
 if args.stgformer_spatial_edge_bias_eps <= 0:
     parser.error('--stgformer_spatial_edge_bias_eps must be > 0.')
+if args.stgformer_anchor_residual_scale and not args.stgformer_temporal_residual:
+    parser.error('--stgformer_anchor_residual_scale requires --stgformer_temporal_residual true.')
+if args.stgformer_anchor_residual_max_delta <= 0:
+    parser.error('--stgformer_anchor_residual_max_delta must be > 0.')
+if not (
+    1.0 - args.stgformer_anchor_residual_max_delta
+    <= args.stgformer_anchor_residual_init
+    <= 1.0 + args.stgformer_anchor_residual_max_delta
+):
+    parser.error('--stgformer_anchor_residual_init must be within [1-max_delta, 1+max_delta].')
 if args.backbone_support_gate_hidden_dim <= 0:
     parser.error('--backbone_support_gate_hidden_dim must be > 0.')
 if args.backbone_support_gate_temperature <= 0:
@@ -675,6 +850,46 @@ if args.backbone_temporal_gate_hidden_dim <= 0:
     parser.error('--backbone_temporal_gate_hidden_dim must be > 0.')
 if args.backbone_branch_gate_hidden_dim <= 0:
     parser.error('--backbone_branch_gate_hidden_dim must be > 0.')
+if args.backbone_dynamic_graph_hidden_dim <= 0:
+    parser.error('--backbone_dynamic_graph_hidden_dim must be > 0.')
+if args.backbone_dynamic_graph_topk < 0:
+    parser.error('--backbone_dynamic_graph_topk must be >= 0.')
+if not (0.0 < args.backbone_dynamic_graph_init_lambda < 1.0):
+    parser.error('--backbone_dynamic_graph_init_lambda must be within (0, 1).')
+if args.backbone_dynamic_graph_residual_init < 0:
+    parser.error('--backbone_dynamic_graph_residual_init must be >= 0.')
+if args.branch_fusion_hidden_dim <= 0:
+    parser.error('--branch_fusion_hidden_dim must be > 0.')
+if not (0.0 <= args.branch_fusion_dropout < 1.0):
+    parser.error('--branch_fusion_dropout must be within [0, 1).')
+if args.branch_fusion_init_main_bias < 0:
+    parser.error('--branch_fusion_init_main_bias must be >= 0.')
+if args.residual_gate_hidden_dim <= 0:
+    parser.error('--residual_gate_hidden_dim must be > 0.')
+if not (0.0 <= args.residual_gate_dropout < 1.0):
+    parser.error('--residual_gate_dropout must be within [0, 1).')
+if not (0.0 < args.residual_gate_init < 1.0):
+    parser.error('--residual_gate_init must be within (0, 1).')
+if args.residual_gate_anchor_embed_dim <= 0:
+    parser.error('--residual_gate_anchor_embed_dim must be > 0.')
+if args.residual_gate_horizon_embed_dim <= 0:
+    parser.error('--residual_gate_horizon_embed_dim must be > 0.')
+if args.residual_gate_branch_embed_dim <= 0:
+    parser.error('--residual_gate_branch_embed_dim must be > 0.')
+if args.branch_fusion and args.residual_gate_fusion:
+    parser.error('--branch_fusion and --residual_gate_fusion cannot be combined.')
+if args.residual_correction_hidden_dim <= 0:
+    parser.error('--residual_correction_hidden_dim must be > 0.')
+if args.residual_correction_horizon_embed_dim <= 0:
+    parser.error('--residual_correction_horizon_embed_dim must be > 0.')
+if args.residual_correction_anchor_embed_dim <= 0:
+    parser.error('--residual_correction_anchor_embed_dim must be > 0.')
+if not (0.0 <= args.residual_correction_dropout < 1.0):
+    parser.error('--residual_correction_dropout must be within [0, 1).')
+if not (0.0 < args.residual_correction_init < 1.0):
+    parser.error('--residual_correction_init must be within (0, 1).')
+if args.backbone_dynamic_graph and args.backbone_dynamic_graph_residual:
+    parser.error('--backbone_dynamic_graph and --backbone_dynamic_graph_residual should not be combined.')
 if args.backbone_multiscale_temporal and not args.backbone_temporal_dilations:
     parser.error('--backbone_multiscale_temporal requires --backbone_temporal_dilations to include at least one positive dilation.')
 if any(dilation <= 0 for dilation in args.backbone_temporal_dilations):
@@ -800,6 +1015,10 @@ hyperparameter_defaults = dict(
         trend_attention_heads=args.trend_attention_heads,
         trend_dropout=args.trend_dropout,
         horizon_specific_prediction_head=args.horizon_specific_prediction_head,
+        horizon_aware_prediction_head=args.horizon_aware_prediction_head,
+        horizon_head_hidden_dim=args.horizon_head_hidden_dim,
+        horizon_head_embed_dim=args.horizon_head_embed_dim,
+        horizon_head_dropout=args.horizon_head_dropout,
         horizon_graph_fusion_decoder=args.horizon_graph_fusion_decoder,
         horizon_graph_decoder_residual=args.horizon_graph_decoder_residual,
         ast_tcn_residual=args.ast_tcn_residual,
@@ -857,6 +1076,10 @@ hyperparameter_defaults = dict(
         stgformer_spatial_edge_bias=args.stgformer_spatial_edge_bias,
         stgformer_spatial_edge_bias_init=args.stgformer_spatial_edge_bias_init,
         stgformer_spatial_edge_bias_eps=args.stgformer_spatial_edge_bias_eps,
+        stgformer_anchor_residual_scale=args.stgformer_anchor_residual_scale,
+        stgformer_anchor_residual_init=args.stgformer_anchor_residual_init,
+        stgformer_anchor_residual_max_delta=args.stgformer_anchor_residual_max_delta,
+        stgformer_anchor_residual_hours=args.stgformer_anchor_residual_hours,
         backbone_adaptive_graph=args.backbone_adaptive_graph,
         backbone_support_gate_hidden_dim=args.backbone_support_gate_hidden_dim,
         backbone_support_gate_temperature=args.backbone_support_gate_temperature,
@@ -865,6 +1088,31 @@ hyperparameter_defaults = dict(
         backbone_temporal_gate_hidden_dim=args.backbone_temporal_gate_hidden_dim,
         backbone_branch_gate=args.backbone_branch_gate,
         backbone_branch_gate_hidden_dim=args.backbone_branch_gate_hidden_dim,
+        backbone_dynamic_graph=args.backbone_dynamic_graph,
+        backbone_dynamic_graph_hidden_dim=args.backbone_dynamic_graph_hidden_dim,
+        backbone_dynamic_graph_topk=args.backbone_dynamic_graph_topk,
+        backbone_dynamic_graph_init_lambda=args.backbone_dynamic_graph_init_lambda,
+        backbone_dynamic_graph_residual=args.backbone_dynamic_graph_residual,
+        backbone_dynamic_graph_residual_init=args.backbone_dynamic_graph_residual_init,
+        branch_fusion=args.branch_fusion,
+        branch_fusion_hidden_dim=args.branch_fusion_hidden_dim,
+        branch_fusion_dropout=args.branch_fusion_dropout,
+        branch_fusion_init_main_bias=args.branch_fusion_init_main_bias,
+        residual_gate_fusion=args.residual_gate_fusion,
+        residual_gate_hidden_dim=args.residual_gate_hidden_dim,
+        residual_gate_dropout=args.residual_gate_dropout,
+        residual_gate_init=args.residual_gate_init,
+        residual_gate_anchor_embed_dim=args.residual_gate_anchor_embed_dim,
+        residual_gate_horizon_embed_dim=args.residual_gate_horizon_embed_dim,
+        residual_gate_branch_embed_dim=args.residual_gate_branch_embed_dim,
+        residual_gate_use_anchor=args.residual_gate_use_anchor,
+        residual_correction_head=args.residual_correction_head,
+        residual_correction_hidden_dim=args.residual_correction_hidden_dim,
+        residual_correction_horizon_embed_dim=args.residual_correction_horizon_embed_dim,
+        residual_correction_anchor_embed_dim=args.residual_correction_anchor_embed_dim,
+        residual_correction_dropout=args.residual_correction_dropout,
+        residual_correction_init=args.residual_correction_init,
+        residual_correction_use_anchor=args.residual_correction_use_anchor,
         d2_hidden_dim=args.d2_hidden_dim,
         d2_num_layers=args.d2_num_layers,
         d2_dropout=args.d2_dropout,
@@ -900,6 +1148,17 @@ hyperparameter_defaults = dict(
         bn_decay=args.bn_decay,
         loss=args.loss,
         huber_delta=args.huber_delta,
+        demand_bucket_weighting=args.demand_bucket_weighting,
+        demand_bucket_quantiles=args.demand_bucket_quantiles,
+        demand_bucket_weights=args.demand_bucket_weights,
+        demand_bucket_thresholds=[],
+        directional_demand_loss=args.directional_demand_loss,
+        directional_low_over_weight=args.directional_low_over_weight,
+        directional_high_under_weight=args.directional_high_under_weight,
+        directional_peak_under_weight=args.directional_peak_under_weight,
+        net_flow_consistency_weight=args.net_flow_consistency_weight,
+        net_flow_out_index=args.net_flow_out_index,
+        net_flow_in_index=args.net_flow_in_index,
         peak_anchor_loss_weight=args.peak_anchor_loss_weight,
         peak_anchor_hours=args.peak_anchor_hours,
         train_anchor_hours=args.train_anchor_hours,
@@ -1039,6 +1298,19 @@ def write_training_summary(best_checkpoint, last_checkpoint, logger_obj, best_va
         'best_val_mae_epoch': _to_float_or_none(best_val_mae_epoch),
         'test_mae': _to_float_or_none(test_result.get('test_mae')),
         'test_loss': _to_float_or_none(test_result.get('test_loss')),
+        'test_flow_loss': _to_float_or_none(test_result.get('test_flow_loss')),
+        'test_net_flow_mae': _to_float_or_none(test_result.get('test_net_flow_mae')),
+        'net_flow_consistency_weight': float(args.net_flow_consistency_weight),
+        'net_flow_out_index': int(args.net_flow_out_index),
+        'net_flow_in_index': int(args.net_flow_in_index),
+        'demand_bucket_weighting': bool(config['train']['demand_bucket_weighting']),
+        'demand_bucket_quantiles': list(config['train']['demand_bucket_quantiles']),
+        'demand_bucket_weights': list(config['train']['demand_bucket_weights']),
+        'demand_bucket_thresholds': config['train'].get('demand_bucket_thresholds', []),
+        'directional_demand_loss': bool(config['train']['directional_demand_loss']),
+        'directional_low_over_weight': float(config['train']['directional_low_over_weight']),
+        'directional_high_under_weight': float(config['train']['directional_high_under_weight']),
+        'directional_peak_under_weight': float(config['train']['directional_peak_under_weight']),
     }
     with open(summary_path, 'w', encoding='utf-8') as fp:
         json.dump(summary, fp, ensure_ascii=False, indent=2)
@@ -1127,6 +1399,7 @@ return_anchor = bool(
     or config['graph']['context_gate_anchor_hour']
     or config['graph']['horizon_graph_fusion_gate']
     or config['model']['ast_tcn_anchor_horizon_gate']
+    or config['model']['stgformer_anchor_residual_scale']
     or config['train']['anchor_homogeneous_batches']
 )
 train_set = Bike(args.data_dir, 'train', return_anchor=return_anchor)
@@ -1164,6 +1437,68 @@ config['data']['in_dim'] = int(train_set.x.shape[-1])
 config['data']['out_dim'] = int(train_set.y.shape[-1])
 config['data']['hist_len'] = int(train_set.x.shape[1])
 config['data']['pred_len'] = int(train_set.y.shape[1])
+
+if (
+    config['train']['demand_bucket_weighting']
+    or config['train']['directional_demand_loss']
+):
+    demand_bucket_thresholds = compute_channel_quantile_thresholds(
+        train_set.y,
+        config['train']['demand_bucket_quantiles'],
+    )
+    config['train']['demand_bucket_thresholds'] = demand_bucket_thresholds.tolist()
+    target_cols = list(getattr(train_set, 'target_cols', []))
+    if config['train']['demand_bucket_weighting']:
+        print(
+            'Demand-bucket weighted training: quantiles=%s weights=%s'
+            % (
+                config['train']['demand_bucket_quantiles'],
+                config['train']['demand_bucket_weights'],
+            )
+        )
+    if config['train']['directional_demand_loss']:
+        print(
+            'Directional demand loss: low_over=%.4f high_under=%.4f peak_under=%.4f'
+            % (
+                config['train']['directional_low_over_weight'],
+                config['train']['directional_high_under_weight'],
+                config['train']['directional_peak_under_weight'],
+            )
+        )
+    for channel_index, thresholds in enumerate(demand_bucket_thresholds):
+        target_name = (
+            target_cols[channel_index]
+            if channel_index < len(target_cols)
+            else 'target_%d' % channel_index
+        )
+        print(
+            'Demand-bucket thresholds channel=%d target=%s thresholds=%s'
+            % (channel_index, target_name, thresholds.tolist())
+        )
+
+if config['train']['net_flow_consistency_weight'] > 0:
+    out_index = int(config['train']['net_flow_out_index'])
+    in_index = int(config['train']['net_flow_in_index'])
+    if max(out_index, in_index) >= config['data']['out_dim']:
+        parser.error(
+            'Net-flow target indices out=%d, in=%d exceed dataset target dimension %d.'
+            % (out_index, in_index, config['data']['out_dim'])
+        )
+    target_cols = list(getattr(train_set, 'target_cols', []))
+    config['train']['net_flow_out_target'] = (
+        target_cols[out_index] if out_index < len(target_cols) else 'target_%d' % out_index
+    )
+    config['train']['net_flow_in_target'] = (
+        target_cols[in_index] if in_index < len(target_cols) else 'target_%d' % in_index
+    )
+    print(
+        'Cumulative net-flow consistency: weight=%.4f, inventory_change=%s - %s'
+        % (
+            config['train']['net_flow_consistency_weight'],
+            config['train']['net_flow_in_target'],
+            config['train']['net_flow_out_target'],
+        )
+    )
 
 
 def resolve_anchor_hour_gate_stats(dataset, requested_index):
@@ -1418,6 +1753,10 @@ class LightningModel(LightningModule):
                 trend_attention_heads=config['model']['trend_attention_heads'],
                 trend_dropout=config['model']['trend_dropout'],
                 horizon_specific_prediction_head=config['model']['horizon_specific_prediction_head'],
+                horizon_aware_prediction_head=config['model']['horizon_aware_prediction_head'],
+                horizon_head_hidden_dim=config['model']['horizon_head_hidden_dim'],
+                horizon_head_embed_dim=config['model']['horizon_head_embed_dim'],
+                horizon_head_dropout=config['model']['horizon_head_dropout'],
                 horizon_graph_fusion_decoder=config['model']['horizon_graph_fusion_decoder'],
                 horizon_graph_decoder_residual=config['model']['horizon_graph_decoder_residual'],
                 ast_tcn_residual=config['model']['ast_tcn_residual'],
@@ -1476,6 +1815,10 @@ class LightningModel(LightningModule):
                 stgformer_spatial_edge_bias=config['model']['stgformer_spatial_edge_bias'],
                 stgformer_spatial_edge_bias_init=config['model']['stgformer_spatial_edge_bias_init'],
                 stgformer_spatial_edge_bias_eps=config['model']['stgformer_spatial_edge_bias_eps'],
+                stgformer_anchor_residual_scale=config['model']['stgformer_anchor_residual_scale'],
+                stgformer_anchor_residual_init=config['model']['stgformer_anchor_residual_init'],
+                stgformer_anchor_residual_max_delta=config['model']['stgformer_anchor_residual_max_delta'],
+                stgformer_anchor_residual_hours=config['model']['stgformer_anchor_residual_hours'],
                 backbone_adaptive_graph=config['model']['backbone_adaptive_graph'],
                 backbone_support_gate_hidden_dim=config['model']['backbone_support_gate_hidden_dim'],
                 backbone_support_gate_temperature=config['model']['backbone_support_gate_temperature'],
@@ -1484,6 +1827,31 @@ class LightningModel(LightningModule):
                 backbone_temporal_gate_hidden_dim=config['model']['backbone_temporal_gate_hidden_dim'],
                 backbone_branch_gate=config['model']['backbone_branch_gate'],
                 backbone_branch_gate_hidden_dim=config['model']['backbone_branch_gate_hidden_dim'],
+                backbone_dynamic_graph=config['model']['backbone_dynamic_graph'],
+                backbone_dynamic_graph_hidden_dim=config['model']['backbone_dynamic_graph_hidden_dim'],
+                backbone_dynamic_graph_topk=config['model']['backbone_dynamic_graph_topk'],
+                backbone_dynamic_graph_init_lambda=config['model']['backbone_dynamic_graph_init_lambda'],
+                backbone_dynamic_graph_residual=config['model']['backbone_dynamic_graph_residual'],
+                backbone_dynamic_graph_residual_init=config['model']['backbone_dynamic_graph_residual_init'],
+                branch_fusion=config['model']['branch_fusion'],
+                branch_fusion_hidden_dim=config['model']['branch_fusion_hidden_dim'],
+                branch_fusion_dropout=config['model']['branch_fusion_dropout'],
+                branch_fusion_init_main_bias=config['model']['branch_fusion_init_main_bias'],
+                residual_gate_fusion=config['model']['residual_gate_fusion'],
+                residual_gate_hidden_dim=config['model']['residual_gate_hidden_dim'],
+                residual_gate_dropout=config['model']['residual_gate_dropout'],
+                residual_gate_init=config['model']['residual_gate_init'],
+                residual_gate_anchor_embed_dim=config['model']['residual_gate_anchor_embed_dim'],
+                residual_gate_horizon_embed_dim=config['model']['residual_gate_horizon_embed_dim'],
+                residual_gate_branch_embed_dim=config['model']['residual_gate_branch_embed_dim'],
+                residual_gate_use_anchor=config['model']['residual_gate_use_anchor'],
+                residual_correction_head=config['model']['residual_correction_head'],
+                residual_correction_hidden_dim=config['model']['residual_correction_hidden_dim'],
+                residual_correction_horizon_embed_dim=config['model']['residual_correction_horizon_embed_dim'],
+                residual_correction_anchor_embed_dim=config['model']['residual_correction_anchor_embed_dim'],
+                residual_correction_dropout=config['model']['residual_correction_dropout'],
+                residual_correction_init=config['model']['residual_correction_init'],
+                residual_correction_use_anchor=config['model']['residual_correction_use_anchor'],
             )
         elif config['model']['use'] == 'D2STGNN':
             self.model = D2STGNNFusionBackbone(
@@ -1511,6 +1879,8 @@ class LightningModel(LightningModule):
             if (
                 param_name.endswith('fusion_alpha')
                 or param_name.endswith('residual_alpha')
+                or param_name.endswith('correction_alpha')
+                or param_name.endswith('scale_logit')
                 or param_name.endswith('edge_bias_scale')
             ):
                 continue
@@ -1521,6 +1891,9 @@ class LightningModel(LightningModule):
                 nn.init.zeros_(param)
                 continue
             if config['model'].get('stgformer_temporal_zero_init', False) and param_name.startswith('stgformer_temporal_branch.output_proj.4.'):
+                nn.init.zeros_(param)
+                continue
+            if config['model'].get('residual_correction_head', False) and param_name.startswith('residual_correction_head.output_proj.4.'):
                 nn.init.zeros_(param)
                 continue
             if config['model'].get('ast_tcn_residual_gate', False) and param_name.startswith('ast_tcn_branch.residual_gate.4.'):
@@ -1570,34 +1943,73 @@ class LightningModel(LightningModule):
             return masked_huber(y_hat, y, delta=self.huber_delta)
         return masked_mae(y_hat, y)
 
-    def _compute_weighted_loss(self, y_hat, y, anchor_hours):
-        if config['train']['peak_anchor_loss_weight'] == 1.0:
-            return self._compute_loss(y_hat, y)
-        peak_hours = config['train']['peak_anchor_hours']
-        if not peak_hours:
-            return self._compute_loss(y_hat, y)
-        anchor_hours = anchor_hours.to(device).long()
-        peak_mask = torch.zeros_like(anchor_hours, dtype=torch.bool)
-        for peak_hour in peak_hours:
-            peak_mask = peak_mask | (anchor_hours == int(peak_hour))
-        sample_weight = torch.ones_like(anchor_hours, dtype=y_hat.dtype, device=device)
-        sample_weight = torch.where(
-            peak_mask,
-            sample_weight * float(config['train']['peak_anchor_loss_weight']),
-            sample_weight,
+    def _compute_net_flow_loss(self, y_hat, y):
+        required_target_dim = max(
+            int(config['train']['net_flow_out_index']),
+            int(config['train']['net_flow_in_index']),
+        ) + 1
+        if y_hat.shape[-1] < required_target_dim:
+            return y_hat.new_zeros(())
+        return cumulative_net_flow_mae(
+            y_hat,
+            y,
+            outflow_index=config['train']['net_flow_out_index'],
+            inflow_index=config['train']['net_flow_in_index'],
         )
-        weight_shape = [sample_weight.shape[0]] + [1] * (y_hat.dim() - 1)
-        sample_weight = sample_weight.view(*weight_shape)
-        if self.loss_name == 'huber':
-            abs_error = torch.abs(y_hat - y)
-            quadratic = torch.clamp(abs_error, max=self.huber_delta)
-            linear = abs_error - quadratic
-            loss = 0.5 * quadratic ** 2 + self.huber_delta * linear
-        else:
-            loss = torch.abs(y_hat - y)
-        loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
-        weighted = loss * sample_weight
-        return weighted.mean() / sample_weight.mean().clamp(min=1e-6)
+
+    def _combine_losses(self, flow_loss, net_flow_loss):
+        return (
+            flow_loss
+            + float(config['train']['net_flow_consistency_weight']) * net_flow_loss
+        )
+
+    def _compute_weighted_loss(self, y_hat, y, anchor_hours=None):
+        element_weight = torch.ones_like(y)
+        if (
+            config['train']['peak_anchor_loss_weight'] != 1.0
+            and config['train']['peak_anchor_hours']
+            and anchor_hours is not None
+        ):
+            anchor_hours = anchor_hours.to(y_hat.device).long()
+            peak_mask = torch.zeros_like(anchor_hours, dtype=torch.bool)
+            for peak_hour in config['train']['peak_anchor_hours']:
+                peak_mask = peak_mask | (anchor_hours == int(peak_hour))
+            sample_weight = torch.where(
+                peak_mask,
+                torch.full_like(anchor_hours, float(config['train']['peak_anchor_loss_weight']), dtype=y_hat.dtype),
+                torch.ones_like(anchor_hours, dtype=y_hat.dtype),
+            )
+            weight_shape = [sample_weight.shape[0]] + [1] * (y_hat.dim() - 1)
+            element_weight = element_weight * sample_weight.view(*weight_shape)
+        if config['train']['demand_bucket_weighting']:
+            demand_weight = build_torch_demand_weights(
+                y,
+                config['train']['demand_bucket_thresholds'],
+                config['train']['demand_bucket_weights'],
+            )
+            element_weight = element_weight * demand_weight
+        return weighted_point_loss(
+            y_hat,
+            y,
+            element_weight,
+            loss_name=self.loss_name,
+            huber_delta=self.huber_delta,
+        )
+
+    def _compute_directional_demand_loss(self, y_hat, y):
+        penalties = directional_demand_penalties(
+            y_hat,
+            y,
+            config['train']['demand_bucket_thresholds'],
+            loss_name=self.loss_name,
+            huber_delta=self.huber_delta,
+        )
+        weighted = (
+            float(config['train']['directional_low_over_weight']) * penalties['low_over']
+            + float(config['train']['directional_high_under_weight']) * penalties['high_under']
+            + float(config['train']['directional_peak_under_weight']) * penalties['peak_under']
+        )
+        return weighted, penalties
 
     def _sync_frozen_module_modes(self):
         if not config['train'].get('freeze_non_ast_tcn', False):
@@ -1634,30 +2046,60 @@ class LightningModel(LightningModule):
         y_hat = self(x, anchor_hours=anchor_hours)
         y_hat = self.scaler.inverse_transform(y_hat)
         y_hat = self._apply_output_constraint(y_hat)
-        loss = self._compute_loss(y_hat, y)
+        flow_loss = self._compute_loss(y_hat, y)
         mae_loss = masked_mae(y_hat, y)
-        return y_hat, y, loss, mae_loss, anchor_hours
+        net_flow_loss = self._compute_net_flow_loss(y_hat, y)
+        return y_hat, y, flow_loss, mae_loss, net_flow_loss, anchor_hours
 
     def training_step(self, batch, batch_idx):
-        y_hat, y, loss, mae_loss, anchor_hours = self._run_model(batch)
-        if anchor_hours is not None:
-            loss = self._compute_weighted_loss(y_hat, y, anchor_hours)
+        y_hat, y, flow_loss, mae_loss, net_flow_loss, anchor_hours = self._run_model(batch)
+        unweighted_flow_loss = flow_loss
+        if (
+            config['train']['peak_anchor_loss_weight'] != 1.0
+            or config['train']['demand_bucket_weighting']
+        ):
+            flow_loss = self._compute_weighted_loss(y_hat, y, anchor_hours)
+        directional_loss = y_hat.new_zeros(())
+        directional_penalties = {
+            'low_over': y_hat.new_zeros(()),
+            'high_under': y_hat.new_zeros(()),
+            'peak_under': y_hat.new_zeros(()),
+        }
+        if config['train']['directional_demand_loss']:
+            directional_loss, directional_penalties = self._compute_directional_demand_loss(
+                y_hat,
+                y,
+            )
+        loss = self._combine_losses(flow_loss, net_flow_loss) + directional_loss
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log('train_flow_loss', flow_loss, on_step=True, on_epoch=True, prog_bar=False, logger=True)
+        self.log('train_unweighted_flow_loss', unweighted_flow_loss, on_step=True, on_epoch=True, prog_bar=False, logger=True)
+        self.log('train_directional_loss', directional_loss, on_step=True, on_epoch=True, prog_bar=False, logger=True)
+        self.log('train_low_over_penalty', directional_penalties['low_over'], on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        self.log('train_high_under_penalty', directional_penalties['high_under'], on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        self.log('train_peak_under_penalty', directional_penalties['peak_under'], on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        self.log('train_net_flow_mae', net_flow_loss, on_step=True, on_epoch=True, prog_bar=False, logger=True)
         self.log('train_mae', mae_loss, on_step=True, on_epoch=True, prog_bar=False, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        y_hat, y, loss, mae_loss, _ = self._run_model(batch)
+        y_hat, y, flow_loss, mae_loss, net_flow_loss, _ = self._run_model(batch)
+        loss = self._combine_losses(flow_loss, net_flow_loss)
         self.log('val_loss_step', loss, on_step=True, on_epoch=False, prog_bar=False, logger=True)
         self.log('val_mae_step', mae_loss, on_step=True, on_epoch=False, prog_bar=False, logger=True)
         self.log('val_loss_epoch', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         self.log('val_mae_epoch', mae_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log('val_flow_loss_epoch', flow_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        self.log('val_net_flow_mae_epoch', net_flow_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
     def test_step(self, batch, batch_idx):
-        y_hat, y, loss, mae_loss, _ = self._run_model(batch)
+        y_hat, y, flow_loss, mae_loss, net_flow_loss, _ = self._run_model(batch)
+        loss = self._combine_losses(flow_loss, net_flow_loss)
         self.metric_lightning(y_hat.cpu().float(), y.cpu().float())
         self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         self.log('test_mae', mae_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        self.log('test_flow_loss', flow_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        self.log('test_net_flow_mae', net_flow_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
 
     def test_epoch_end(self, outputs):
         self.log_dict(self.metric_lightning.compute())
