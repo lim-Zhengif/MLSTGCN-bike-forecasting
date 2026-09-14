@@ -1,0 +1,11 @@
+experiment_id: B1
+initialization: from_scratch_same_seed_as_B0
+relations: [dist, distri, od00, od03, od06, od09, od12, od15, od18, od21]
+external_order: 2
+initial_strength: 0.01
+mixture: static_softmax_over_relation_and_order
+injection: official_nonidentity_propagation_plus_tanh_strength_times_external_minus_input
+anchor_conditioning: false
+horizon_conditioning: false
+training: {epochs: 80, batch_size: 16, lr: 0.0003, patience: 12}
+note: Documentation only; CLI defaults are authoritative.
