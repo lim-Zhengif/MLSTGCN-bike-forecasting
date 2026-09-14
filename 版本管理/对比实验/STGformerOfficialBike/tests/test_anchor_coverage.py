@@ -2,6 +2,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 if str(PACKAGE_ROOT) not in sys.path:
@@ -48,12 +50,15 @@ class AnchorCoverageTest(unittest.TestCase):
         )
 
     def test_complete_range_has_no_missing_or_duplicate_anchors(self):
-        sample_datetimes = [
-            "2026-06-29 00:00:00",
-            "2026-06-29 12:00:00",
-            "2026-06-30 00:00:00",
-            "2026-06-30 12:00:00",
-        ]
+        sample_datetimes = np.asarray(
+            [
+                "2026-06-29 00:00:00",
+                "2026-06-29 12:00:00",
+                "2026-06-30 00:00:00",
+                "2026-06-30 12:00:00",
+            ],
+            dtype=np.str_,
+        )
         coverage = audit_anchor_coverage(
             sample_datetimes,
             "2026-06-29",

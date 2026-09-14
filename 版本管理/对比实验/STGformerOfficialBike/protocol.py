@@ -99,7 +99,9 @@ def audit_anchor_coverage(
     for date_value in pd.date_range(start, end, freq="D"):
         for anchor_hour in anchors:
             expected.append(date_value + pd.Timedelta(hours=anchor_hour))
-    provided = [pd.Timestamp(value) for value in sample_datetimes]
+    # pandas 1.x rejects numpy.str_ even though it accepts the equivalent
+    # built-in str. Sample metadata comes from a NumPy string array here.
+    provided = [pd.Timestamp(str(value)) for value in sample_datetimes]
     provided_set = set(provided)
     missing = [value for value in expected if value not in provided_set]
     duplicate_count = len(provided) - len(provided_set)
