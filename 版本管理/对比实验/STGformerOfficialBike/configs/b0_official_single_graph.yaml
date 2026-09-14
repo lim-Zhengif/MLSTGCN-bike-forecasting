@@ -1,0 +1,44 @@
+schema_version: 1
+experiment_id: B0
+model: stgformer_official_core_bike_b0
+upstream_commit: 7c141029328a91cfeb78c1d8a0bfaa26997d30a0
+data_contract:
+  history_steps: 168
+  forecast_steps: 3
+  nodes: 150
+  output_channels: [outflow, inflow]
+  anchor_hours: [0, 3, 6, 9, 12, 15, 18, 21]
+model_config:
+  steps_per_day: 24
+  hour_feature_index: 3
+  dow_feature_index: 4
+  input_embedding_dim: 24
+  tod_embedding_dim: 12
+  dow_embedding_dim: 12
+  adaptive_embedding_dim: 12
+  num_heads: 4
+  num_layers: 3
+  dropout: 0.1
+  mlp_ratio: 2.0
+  dropout_a: 0.3
+  kernel_size: 1
+  order: 2
+graph_contract:
+  audit_graph: dist
+  audit_graph_role: node_order_audit_only
+  model_graph_source: learned_adaptive_embedding
+training:
+  epochs: 80
+  batch_size: 16
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  patience: 12
+  grad_clip: 1.0
+  loss: smooth_l1
+  seed: 0
+evaluation:
+  external_months: [2026-03, 2026-04, 2026-05, 2026-06]
+  require_complete_dates: true
+  checkpoint_strict: true
+  default_future_weather_regime: oracle_observed_same_day
+  leakage_safe_sensitivity_future_weather_lag_days: 1
