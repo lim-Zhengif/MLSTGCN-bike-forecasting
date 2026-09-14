@@ -36,3 +36,11 @@ The evaluator labels its default same-day observed weather as
 `oracle_observed_same_day`. Use `--future_weather_lag_days 1` for the
 leakage-safe lagged-weather sensitivity run; the summary keeps the two regimes
 separate.
+
+The default holdout ends on 2026-06-30 and predicts `t+1..t+3`. Consequently,
+the 21:00 anchor on that date needs trip counts through 2026-07-01 00:00. The
+default `--trip_glob` therefore includes the July 2026 files. Copy those files
+to the server before running the complete 976-anchor evaluation. If July data
+is unavailable, `--end_date 2026-06-29 --trip_glob "20260[2-6]-citibike-tripdata*.csv"`
+is a valid 968-anchor truncated run, but it is not the planned full-range
+protocol.

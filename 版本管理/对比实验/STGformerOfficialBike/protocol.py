@@ -76,6 +76,46 @@ def anchor_metrics(pred, true, anchor_hours):
     return pd.DataFrame(rows)
 
 
+def audit_anchor_coverage(
+    sample_datetimes,
+    start_date,
+    end_date,
+    anchor_hours,
+    target_start_offset,
+    pred_len,
+):
+    """Describe exact rolling-anchor coverage and the final target hour required."""
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    if end < start:
+        raise ValueError("end_date must not be earlier than start_date")
+    anchors = sorted({int(value) for value in anchor_hours})
+    if not anchors or anchors[0] < 0 or anchors[-1] > 23:
+        raise ValueError("anchor_hours must contain values from 0 through 23")
+    if int(target_start_offset) < 0 or int(pred_len) <= 0:
+        raise ValueError("target_start_offset must be non-negative and pred_len must be positive")
+
+    expected = []
+    for date_value in pd.date_range(start, end, freq="D"):
+        for anchor_hour in anchors:
+            expected.append(date_value + pd.Timedelta(hours=anchor_hour))
+    provided = [pd.Timestamp(value) for value in sample_datetimes]
+    provided_set = set(provided)
+    missing = [value for value in expected if value not in provided_set]
+    duplicate_count = len(provided) - len(provided_set)
+    latest_target = expected[-1] + pd.Timedelta(
+        hours=int(target_start_offset) + int(pred_len) - 1
+    )
+    return {
+        "expected_count": len(expected),
+        "provided_count": len(provided),
+        "missing_anchor_datetimes": [value.strftime("%Y-%m-%d %H:%M:%S") for value in missing],
+        "duplicate_anchor_count": int(duplicate_count),
+        "latest_requested_anchor_datetime": expected[-1].strftime("%Y-%m-%d %H:%M:%S"),
+        "latest_required_target_datetime": latest_target.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
 def init_wandb_run(args, output_dir):
     if args.logger != "wandb":
         return None

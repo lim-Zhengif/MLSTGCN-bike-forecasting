@@ -23,6 +23,7 @@ from protocol import (  # noqa: E402
     MODEL_ID,
     UPSTREAM_COMMIT,
     anchor_metrics,
+    audit_anchor_coverage,
     audit_graph_contract,
     compute_metrics,
     horizon_metrics,
@@ -186,7 +187,14 @@ def main():
     parser.add_argument("--device", default="auto")
     parser.add_argument("--start_date", default="2026-03-01")
     parser.add_argument("--end_date", default="2026-06-30")
-    parser.add_argument("--trip_glob", default="20260[2-6]-citibike-tripdata*.csv")
+    parser.add_argument(
+        "--trip_glob",
+        default="20260[2-7]-citibike-tripdata*.csv",
+        help=(
+            "Trip-file glob. The default includes July because the 2026-06-30 21:00 "
+            "anchor predicts through 2026-07-01 00:00."
+        ),
+    )
     parser.add_argument("--order_dir", default=str(DEFAULT_ORDER_DIR))
     parser.add_argument("--asset_dir", default=str(DEFAULT_ASSET_DIR))
     parser.add_argument("--weather_file", default=str(DEFAULT_WEATHER_FILE))
@@ -227,6 +235,29 @@ def main():
         raise FileNotFoundError("No trip files matched: %s" % (order_dir / args.trip_glob))
     print("Aggregating hourly trip counts from %d files..." % len(trip_files))
     hourly_df, full_hours = aggregate_hourly_trip_counts(trip_files, station_names)
+    requested_coverage = audit_anchor_coverage(
+        [],
+        args.start_date,
+        args.end_date,
+        parse_anchor_hours(args.anchor_hours),
+        args.target_start_offset,
+        metadata["pred_len"],
+    )
+    loaded_hourly_end = pd.Timestamp(full_hours.max())
+    required_target_end = pd.Timestamp(requested_coverage["latest_required_target_datetime"])
+    if loaded_hourly_end < required_target_end and not args.allow_missing_dates:
+        raise RuntimeError(
+            "The requested holdout needs target data through %s, but the loaded trips end at %s. "
+            "The final anchor %s uses t+%d..t+%d targets. Expand --trip_glob to include the "
+            "boundary month (July 2026 for the default range), or shorten --end_date."
+            % (
+                required_target_end.strftime("%Y-%m-%d %H:%M:%S"),
+                loaded_hourly_end.strftime("%Y-%m-%d %H:%M:%S"),
+                requested_coverage["latest_requested_anchor_datetime"],
+                args.target_start_offset,
+                args.target_start_offset + metadata["pred_len"] - 1,
+            )
+        )
     all_dates = sorted(hourly_df["日期"].dropna().unique())
     daily_feature_df, daily_feature_path, aux_paths, weather_path, aux_merge_summary = load_daily_feature_table(
         source_dir=str(asset_dir),
@@ -292,9 +323,37 @@ def main():
     target_start_datetimes = target_start_datetimes[available_mask]
     if len(sample_dates) == 0:
         raise RuntimeError("No requested holdout samples are evaluable")
-    expected_samples = len(wanted_dates) * len(parse_anchor_hours(args.anchor_hours))
-    if not args.allow_missing_dates and len(sample_dates) != expected_samples:
-        raise RuntimeError("Expected %d anchor samples, got %d" % (expected_samples, len(sample_dates)))
+    anchor_coverage = audit_anchor_coverage(
+        sample_datetimes,
+        args.start_date,
+        args.end_date,
+        parse_anchor_hours(args.anchor_hours),
+        args.target_start_offset,
+        metadata["pred_len"],
+    )
+    expected_samples = anchor_coverage["expected_count"]
+    if anchor_coverage["duplicate_anchor_count"]:
+        raise RuntimeError(
+            "External holdout has %d duplicate anchor samples"
+            % anchor_coverage["duplicate_anchor_count"]
+        )
+    missing_anchors = anchor_coverage["missing_anchor_datetimes"]
+    if missing_anchors and not args.allow_missing_dates:
+        preview = ", ".join(missing_anchors[:12])
+        if len(missing_anchors) > 12:
+            preview += ", ..."
+        raise RuntimeError(
+            "Expected %d anchor samples, got %d. Missing anchors (%d): %s. "
+            "The latest requested forecast target is %s; loaded trips end at %s."
+            % (
+                expected_samples,
+                len(sample_dates),
+                len(missing_anchors),
+                preview,
+                anchor_coverage["latest_required_target_datetime"],
+                pd.Timestamp(full_hours.max()).strftime("%Y-%m-%d %H:%M:%S"),
+            )
+        )
 
     device = resolve_device(args.device)
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -383,6 +442,8 @@ def main():
         "missing_dates": missing_dates,
         "num_anchor_samples": int(len(sample_dates)),
         "expected_anchor_samples": int(expected_samples),
+        "missing_anchor_datetimes": missing_anchors,
+        "latest_required_target_datetime": anchor_coverage["latest_required_target_datetime"],
         "pred_shape": list(pred_values.shape),
         "anchor_hours": parse_anchor_hours(args.anchor_hours),
         "overall": compute_metrics(pred_values, y_values),
