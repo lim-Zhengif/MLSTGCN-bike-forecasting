@@ -1,0 +1,36 @@
+schema_version: 1
+experiment_id: G0
+model: stgformer_official_b0_sparse_demand_gate_g0
+control_baseline: B0_STGformerOfficialBike_Top150_hist168_pred3_seeds0-2
+screen_seed: 0
+backbone:
+  frozen: true
+  checkpoint: b0_top150_hist168_pred3_seed0_bs16/best_stgformer_official_b0.pt
+gate:
+  type: history_conditioned_multiplicative_soft_suppression
+  hidden_dim: 16
+  gate_floor: 0.1
+  initial_gate: 0.98
+  observable_history_hours: 24
+  can_increase_prediction: false
+  uses_holdout_features_for_training: false
+training:
+  epochs: 30
+  patience: 8
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  low_demand_weight: 2.0
+  high_demand_preservation_weight: 0.5
+  identity_weight: 0.02
+selection:
+  split: validation_2025
+  zero_selection_weight: 0.15
+  high_tolerance_pct: 0.5
+  high_penalty_weight: 5.0
+external_screen_acceptance:
+  overall_mae_improvement_min_pct: 0.5
+  zero_demand_mae_improvement_min_pct: 15.0
+  high_demand_mae_degradation_max_pct: 1.0
+  rmse_and_net_mae_degradation_max_pct: 1.0
+  holdout: 2026-03-01_to_2026-06-30
+  weather_regime: oracle_observed_same_day
