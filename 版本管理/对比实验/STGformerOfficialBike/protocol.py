@@ -152,6 +152,26 @@ def normalize_targets(values, mean, std):
     return ((values.astype(np.float64) - mean) / std).astype(np.float32)
 
 
+def apply_log1p_transform_inplace(feature_values, feature_cols, selected_cols):
+    """Apply the dataset log transform without allocating another full tensor."""
+    if feature_values is None or not selected_cols:
+        return []
+    if not np.issubdtype(feature_values.dtype, np.floating):
+        raise TypeError("feature_values must use a floating dtype for in-place log1p")
+
+    applied_cols = []
+    for feature_name in selected_cols:
+        if feature_name not in feature_cols:
+            continue
+        feature_index = feature_cols.index(feature_name)
+        feature_slice = feature_values[..., feature_index]
+        if np.nanmin(feature_slice) < 0:
+            continue
+        np.log1p(feature_slice, out=feature_slice)
+        applied_cols.append(feature_name)
+    return applied_cols
+
+
 def row_normalize(matrix, add_self=True):
     matrix = np.asarray(matrix, dtype=np.float64)
     if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:

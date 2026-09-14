@@ -23,19 +23,18 @@ from protocol import (  # noqa: E402
     MODEL_ID,
     UPSTREAM_COMMIT,
     anchor_metrics,
+    apply_log1p_transform_inplace,
     audit_anchor_coverage,
     audit_graph_contract,
     compute_metrics,
     horizon_metrics,
     load_npz_metadata,
-    normalize_features,
     resolve_device,
     save_json,
     truth_key_signature,
 )
 from hourly_pipeline_utils import (  # noqa: E402
     aggregate_hourly_trip_counts,
-    apply_log1p_transform,
     build_hourly_feature_frame,
     load_daily_feature_table,
 )
@@ -133,7 +132,9 @@ def apply_future_weather_lag(sample_bundle, feature_df, weather_file, history_fe
     weather_cols = [name for name in future_cols if name in WEATHER_FUTURE_FEATURE_NAMES]
     if not weather_cols:
         return sample_bundle, []
-    x_values = sample_bundle["x"].copy().astype(np.float32)
+    # This array is freshly built for this evaluation, so weather replacement
+    # can safely happen in place instead of duplicating several GiB.
+    x_values = np.asarray(sample_bundle["x"], dtype=np.float32)
     feature_daily = {}
     for name in weather_cols:
         if name in feature_df.columns:
@@ -258,6 +259,30 @@ def main():
                 args.target_start_offset + metadata["pred_len"] - 1,
             )
         )
+    anchor_hours = parse_anchor_hours(args.anchor_hours)
+    required_history_start = (
+        pd.Timestamp(args.start_date).normalize()
+        + pd.Timedelta(hours=min(anchor_hours) - metadata["hist_len"])
+    )
+    loaded_hourly_start = pd.Timestamp(full_hours.min())
+    if loaded_hourly_start > required_history_start and not args.allow_missing_dates:
+        raise RuntimeError(
+            "The requested holdout needs history from %s, but the loaded trips start at %s. "
+            "Expand --trip_glob to include the preceding history window."
+            % (
+                required_history_start.strftime("%Y-%m-%d %H:%M:%S"),
+                loaded_hourly_start.strftime("%Y-%m-%d %H:%M:%S"),
+            )
+        )
+    context_mask = hourly_df["datetime"].between(required_history_start, required_target_end)
+    hourly_df = hourly_df.loc[context_mask].copy()
+    print(
+        "Building samples only for required context %s through %s..."
+        % (
+            required_history_start.strftime("%Y-%m-%d %H:%M:%S"),
+            required_target_end.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+    )
     all_dates = sorted(hourly_df["日期"].dropna().unique())
     daily_feature_df, daily_feature_path, aux_paths, weather_path, aux_merge_summary = load_daily_feature_table(
         source_dir=str(asset_dir),
@@ -276,7 +301,7 @@ def main():
         known_future_feature_cols=metadata["known_future_feature_cols"],
         hist_len=metadata["hist_len"],
         pred_len=metadata["pred_len"],
-        anchor_hours=parse_anchor_hours(args.anchor_hours),
+        anchor_hours=anchor_hours,
         min_known_future_coverage=0.0,
         target_start_offset=args.target_start_offset,
     )
@@ -290,19 +315,18 @@ def main():
     if weather_lag_missing_dates:
         raise RuntimeError("Lagged future weather is unavailable for dates: %s" % weather_lag_missing_dates)
 
-    x_values = sample_bundle["x"].copy()
+    x_values = sample_bundle.pop("x")
     history_feature_count = len(metadata["history_feature_cols"])
-    history_x, applied_history_cols = apply_log1p_transform(
+    applied_history_cols = apply_log1p_transform_inplace(
         x_values[..., :history_feature_count],
         metadata["history_feature_cols"],
         metadata["log1p_feature_cols"],
     )
-    future_x, applied_future_cols = apply_log1p_transform(
+    applied_future_cols = apply_log1p_transform_inplace(
         x_values[..., history_feature_count:],
         sample_bundle["known_future_feature_cols"],
         metadata["log1p_feature_cols"],
     )
-    x_values = np.concatenate([history_x, future_x], axis=-1)
     y_values = np.asarray(sample_bundle["y"], dtype=np.float32)
     sample_dates = np.asarray(sample_bundle["sample_dates"])
     sample_datetimes = np.asarray(sample_bundle["sample_datetimes"])
@@ -315,12 +339,13 @@ def main():
     missing_dates = [date for date in wanted_dates.tolist() if date not in available_dates]
     if missing_dates and not args.allow_missing_dates:
         raise RuntimeError("External holdout has missing dates: %s" % missing_dates)
-    x_values = x_values[available_mask]
-    y_values = y_values[available_mask]
-    sample_dates = sample_dates[available_mask]
-    sample_datetimes = sample_datetimes[available_mask]
-    sample_anchor_hours = sample_anchor_hours[available_mask]
-    target_start_datetimes = target_start_datetimes[available_mask]
+    if not available_mask.all():
+        x_values = x_values[available_mask]
+        y_values = y_values[available_mask]
+        sample_dates = sample_dates[available_mask]
+        sample_datetimes = sample_datetimes[available_mask]
+        sample_anchor_hours = sample_anchor_hours[available_mask]
+        target_start_datetimes = target_start_datetimes[available_mask]
     if len(sample_dates) == 0:
         raise RuntimeError("No requested holdout samples are evaluable")
     anchor_coverage = audit_anchor_coverage(
@@ -360,13 +385,21 @@ def main():
     assert_checkpoint_contract(checkpoint, metadata, graph_audit)
     model, checkpoint_audit = build_model_from_checkpoint(checkpoint, device=device)
     model.eval()
-    x_scaled = normalize_features(x_values, checkpoint["feature_mean"], checkpoint["feature_std"])
+    feature_mean = torch.as_tensor(
+        np.asarray(checkpoint["feature_mean"]).reshape(-1), dtype=torch.float32, device=device
+    )
+    feature_std = torch.as_tensor(
+        np.asarray(checkpoint["feature_std"]).reshape(-1), dtype=torch.float32, device=device
+    )
     target_mean = torch.as_tensor(checkpoint["target_mean"], dtype=torch.float32, device=device)
     target_std = torch.as_tensor(checkpoint["target_std"], dtype=torch.float32, device=device)
     predictions = []
     with torch.no_grad():
-        for start in range(0, len(x_scaled), args.batch_size):
-            batch = torch.from_numpy(x_scaled[start : start + args.batch_size]).to(device)
+        for start in range(0, len(x_values), args.batch_size):
+            raw_batch = torch.from_numpy(
+                np.asarray(x_values[start : start + args.batch_size], dtype=np.float32)
+            ).to(device)
+            batch = (raw_batch - feature_mean) / feature_std
             prediction = F.softplus(model(batch) * target_std + target_mean, beta=5.0)
             predictions.append(prediction.cpu().numpy())
     pred_values = np.concatenate(predictions, axis=0)
@@ -461,6 +494,7 @@ def main():
         "future_weather_lag_missing_dates": weather_lag_missing_dates,
         "trip_glob": args.trip_glob,
         "hourly_range": [str(full_hours.min()), str(full_hours.max())],
+        "sample_build_context_range": [str(required_history_start), str(required_target_end)],
         "aux_paths": aux_paths,
         "aux_merge_summary": aux_merge_summary,
         "applied_log1p_cols": sorted(set(applied_history_cols + applied_future_cols)),
