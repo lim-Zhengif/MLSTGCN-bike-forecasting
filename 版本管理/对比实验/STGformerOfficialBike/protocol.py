@@ -15,6 +15,37 @@ MODEL_ID = "stgformer_official_core_bike_b0"
 DEFAULT_WANDB_PROJECT = "top150_rolling6h_model_compare"
 
 
+def b0_training_run_name(seed, batch_size):
+    return "b0_top150_hist168_pred3_seed%d_bs%d" % (int(seed), int(batch_size))
+
+
+def b0_holdout_names(seed, start_date, end_date, future_weather_lag_days):
+    start_tag = pd.Timestamp(start_date).strftime("%Y%m")
+    end_tag = pd.Timestamp(end_date).strftime("%Y%m")
+    lag_days = int(future_weather_lag_days)
+    regime_tag = "oracle" if lag_days == 0 else "lag%d" % lag_days
+    run_name = "holdout_%s_%s_seed%d_%s" % (
+        start_tag,
+        end_tag,
+        int(seed),
+        regime_tag,
+    )
+    eval_tag = "stgformer_official_b0_seed%d_%s_%s_%s" % (
+        int(seed),
+        start_tag,
+        end_tag,
+        regime_tag,
+    )
+    return run_name, eval_tag
+
+
+def checkpoint_training_seed(checkpoint):
+    args = checkpoint.get("args")
+    if not isinstance(args, dict) or "seed" not in args:
+        raise RuntimeError("Checkpoint does not record args.seed")
+    return int(args["seed"])
+
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)

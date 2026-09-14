@@ -25,6 +25,7 @@ from protocol import (  # noqa: E402
     UPSTREAM_COMMIT,
     anchor_metrics,
     audit_graph_contract,
+    b0_training_run_name,
     compute_metrics,
     compute_stats_float64,
     environment_info,
@@ -46,9 +47,7 @@ DEFAULT_GRAPH_DIR = PROJECT_ROOT / "data" / "graph" / (
     "bike_hourly_safe_inventory_top150_exp10_anchor_hour_od_graph_"
     "train2025_hist168_pred3_8anchors"
 )
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "分析结果" / "对比实验" / "STGformerOfficialBike" / (
-    "b0_top150_hist168_pred3_seed0_bs16"
-)
+DEFAULT_RESULT_ROOT = PROJECT_ROOT / "分析结果" / "对比实验" / "STGformerOfficialBike"
 
 
 class NormalizedPairDataset(Dataset):
@@ -164,7 +163,11 @@ def main():
     parser.add_argument("--data_dir", default=str(DEFAULT_DATA_DIR))
     parser.add_argument("--graph_dir", default=str(DEFAULT_GRAPH_DIR))
     parser.add_argument("--graph_name", default="dist")
-    parser.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_DIR))
+    parser.add_argument(
+        "--output_dir",
+        default=None,
+        help="Defaults to a seed-aware directory under the STGformerOfficialBike result root.",
+    )
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=0)
@@ -197,6 +200,10 @@ def main():
     args = parser.parse_args()
     if args.epochs < 1:
         raise ValueError("epochs must be positive")
+    if args.output_dir is None:
+        args.output_dir = str(
+            DEFAULT_RESULT_ROOT / b0_training_run_name(args.seed, args.batch_size)
+        )
 
     set_seed(args.seed)
     data_dir = Path(args.data_dir)

@@ -26,6 +26,9 @@ from protocol import (  # noqa: E402
     apply_log1p_transform_inplace,
     audit_anchor_coverage,
     audit_graph_contract,
+    b0_holdout_names,
+    b0_training_run_name,
+    checkpoint_training_seed,
     compute_metrics,
     horizon_metrics,
     load_npz_metadata,
@@ -53,10 +56,8 @@ DEFAULT_GRAPH_DIR = PROJECT_ROOT / "data" / "graph" / (
     "bike_hourly_safe_inventory_top150_exp10_anchor_hour_od_graph_"
     "train2025_hist168_pred3_8anchors"
 )
-DEFAULT_CHECKPOINT = PROJECT_ROOT / "分析结果" / "对比实验" / "STGformerOfficialBike" / (
-    "b0_top150_hist168_pred3_seed0_bs16"
-) / "best_stgformer_official_b0.pt"
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "分析结果" / "对比实验" / "STGformerOfficialBike" / "holdout_202603_202606"
+DEFAULT_RESULT_ROOT = PROJECT_ROOT / "分析结果" / "对比实验" / "STGformerOfficialBike"
+DEFAULT_TRAINING_BATCH_SIZE = 16
 DEFAULT_ORDER_DIR = PROJECT_ROOT / "二月份数据处理" / "纽约单车订单数据"
 DEFAULT_ASSET_DIR = PROJECT_ROOT / "二月份数据处理" / "nyc_top300_inventory_validation"
 DEFAULT_WEATHER_FILE = PROJECT_ROOT / "二月份数据处理" / "weather-get" / (
@@ -184,7 +185,12 @@ def main():
     parser.add_argument("--data_dir", default=str(DEFAULT_DATA_DIR))
     parser.add_argument("--graph_dir", default=str(DEFAULT_GRAPH_DIR))
     parser.add_argument("--graph_name", default="dist")
-    parser.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT))
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Defaults to the checkpoint in the seed-aware training directory.",
+    )
+    parser.add_argument("--seed", type=int, default=0, help="Expected checkpoint training seed.")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--start_date", default="2026-03-01")
     parser.add_argument("--end_date", default="2026-06-30")
@@ -205,15 +211,40 @@ def main():
         default=0,
         help="0 uses same-day observed weather (oracle); positive values use only earlier observations.",
     )
-    parser.add_argument("--eval_tag", default="stgformer_official_b0_202603_202606")
+    parser.add_argument(
+        "--eval_tag",
+        default=None,
+        help="Defaults to a seed- and weather-regime-aware file prefix.",
+    )
     parser.add_argument("--anchor_hours", default="0,3,6,9,12,15,18,21")
     parser.add_argument("--target_start_offset", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_DIR))
+    parser.add_argument(
+        "--output_dir",
+        default=None,
+        help="Defaults to a seed- and weather-regime-aware holdout directory.",
+    )
     parser.add_argument("--allow_missing_dates", action="store_true")
     args = parser.parse_args()
     if args.future_weather_lag_days < 0:
         raise ValueError("future_weather_lag_days must be non-negative")
+
+    default_run_name, default_eval_tag = b0_holdout_names(
+        args.seed,
+        args.start_date,
+        args.end_date,
+        args.future_weather_lag_days,
+    )
+    if args.checkpoint is None:
+        args.checkpoint = str(
+            DEFAULT_RESULT_ROOT
+            / b0_training_run_name(args.seed, DEFAULT_TRAINING_BATCH_SIZE)
+            / "best_stgformer_official_b0.pt"
+        )
+    if args.output_dir is None:
+        args.output_dir = str(DEFAULT_RESULT_ROOT / default_run_name)
+    if args.eval_tag is None:
+        args.eval_tag = default_eval_tag
 
     data_dir = absolute_path(args.data_dir)
     graph_dir = absolute_path(args.graph_dir)
@@ -382,6 +413,12 @@ def main():
 
     device = resolve_device(args.device)
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    actual_seed = checkpoint_training_seed(checkpoint)
+    if actual_seed != int(args.seed):
+        raise RuntimeError(
+            "Checkpoint seed mismatch: --seed=%d but checkpoint args.seed=%d"
+            % (args.seed, actual_seed)
+        )
     assert_checkpoint_contract(checkpoint, metadata, graph_audit)
     model, checkpoint_audit = build_model_from_checkpoint(checkpoint, device=device)
     model.eval()
@@ -463,6 +500,7 @@ def main():
         "model": MODEL_ID,
         "upstream_commit": UPSTREAM_COMMIT,
         "checkpoint": str(checkpoint_path),
+        "seed": actual_seed,
         "checkpoint_missing_keys": checkpoint_audit["missing_keys"],
         "checkpoint_unexpected_keys": checkpoint_audit["unexpected_keys"],
         "data_dir": str(data_dir),

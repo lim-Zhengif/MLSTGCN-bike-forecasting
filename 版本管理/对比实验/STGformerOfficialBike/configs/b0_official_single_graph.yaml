@@ -2,6 +2,7 @@ schema_version: 1
 experiment_id: B0
 model: stgformer_official_core_bike_b0
 upstream_commit: 7c141029328a91cfeb78c1d8a0bfaa26997d30a0
+baseline_status: frozen_multiseed_external_verified
 data_contract:
   history_steps: 168
   forecast_steps: 3
@@ -35,10 +36,15 @@ training:
   patience: 12
   grad_clip: 1.0
   loss: smooth_l1
-  seed: 0
+  seeds: [0, 1, 2]
 evaluation:
   external_months: [2026-03, 2026-04, 2026-05, 2026-06]
   require_complete_dates: true
   checkpoint_strict: true
   default_future_weather_regime: oracle_observed_same_day
   leakage_safe_sensitivity_future_weather_lag_days: 1
+output_contract:
+  training_directory: b0_top150_hist168_pred3_seed{seed}_bs16
+  oracle_holdout_directory: holdout_202603_202606_seed{seed}_oracle
+  lag1_holdout_directory: holdout_202603_202606_seed{seed}_lag1
+  require_checkpoint_seed_match: true
